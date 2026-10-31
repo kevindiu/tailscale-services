@@ -174,12 +174,27 @@ On any RustDesk client connected to your Tailnet:
 
 ---
 
-## Maintenance
+---
 
-### Updating Images
+## Maintenance & Automatic Updates
+
+### Automatic Updates (Watchtower)
+**Watchtower** is included in the stack and configured to check Docker Hub daily at **04:00 AM UTC**:
+- **Zero Downtime if No Update:** Watchtower queries Docker Hub's API. If no new image hash exists, nothing is restarted.
+- **Dependency Aware:** `adguardhome`, `rustdesk-hbbs`, and `rustdesk-hbbr` are tagged with `com.centurylinklabs.watchtower.depends-on=tailscale`. If the Tailscale container updates, Watchtower automatically recreates the dependent containers so they re-attach to the new network namespace seamlessly.
+- **Auto Clean:** Automatically prunes old dangling image layers (`WATCHTOWER_CLEANUP=true`).
+
+To view Watchtower status and next scheduled run:
+```bash
+docker compose logs -f watchtower
+```
+
+### Manual Updates (On-Demand)
+If you prefer to trigger updates manually at any time:
 ```bash
 docker compose pull
 docker compose up -d
+docker image prune -f
 ```
 
 ### Inspecting Logs
@@ -188,4 +203,5 @@ docker compose logs -f tailscale
 docker compose logs -f adguardhome
 docker compose logs -f rustdesk-hbbs
 docker compose logs -f rustdesk-hbbr
+docker compose logs -f watchtower
 ```

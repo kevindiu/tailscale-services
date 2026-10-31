@@ -46,6 +46,9 @@ services:
       resources:
         limits:
           memory: 512M
+    labels:
+      # Ensures Watchtower safely recreates AdGuard if Tailscale is updated
+      - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
       - tailscale
 
@@ -63,6 +66,8 @@ services:
       resources:
         limits:
           memory: 256M
+    labels:
+      - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
       - tailscale
 
@@ -79,5 +84,28 @@ services:
       resources:
         limits:
           memory: 256M
+    labels:
+      - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
       - tailscale
+
+  # Automatic image updater: checks Docker Hub for updates and updates only if a new image exists
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Explicit API version negotiation with modern Docker daemons
+      - DOCKER_API_VERSION=1.45
+      # Clean up old, unused image layers after updating
+      - WATCHTOWER_CLEANUP=true
+      # Check daily at 04:00 AM (6-field cron: sec min hour day month weekday)
+      - WATCHTOWER_SCHEDULE=0 0 4 * * *
+      # Handle restarting dependent containers correctly
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+    deploy:
+      resources:
+        limits:
+          memory: 128M
