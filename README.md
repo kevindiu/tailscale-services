@@ -252,3 +252,14 @@ docker compose logs -f rustdesk-hbbs
 docker compose logs -f rustdesk-hbbr
 docker compose logs -f watchtower
 ```
+
+### Restoring Pre-Configured Settings
+The repo includes **[`AdGuardHome.template.yaml`](AdGuardHome.template.yaml)** with all performance settings, encrypted DoH/DoT upstreams, and HaGeZi/OISD blocklists pre-configured (credentials removed).
+
+To restore it to a fresh deployment:
+```bash
+mkdir -p data/adguard/conf
+cp AdGuardHome.template.yaml data/adguard/conf/AdGuardHome.yaml
+docker compose restart adguardhome
+```
+Open the web UI to set your admin username and password.
