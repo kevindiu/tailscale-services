@@ -1,0 +1,83 @@
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    hostname: ${TAILSCALE_HOSTNAME:-adguard-tailscale}
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---advertise-tags=tag:dns-server}
+    volumes:
+      - ./data/tailscale:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    # Least privilege: drop all Linux capabilities, grant only networking caps
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Resource constraints to prevent DoS or memory exhaustion
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    restart: unless-stopped
+    # SECURITY NOTE: Do NOT expose ports to the host interface on a public VPS.
+    # Leaving ports unmapped guarantees traffic is reachable ONLY via your private Tailscale network.
+    # ports:
+    #   - "53:53/tcp"
+    #   - "53:53/udp"
+    #   - "3000:3000/tcp"
+    #   - "80:80/tcp"
+    #   - "21115-21119:21115-21119/tcp"
+    #   - "21116:21116/udp"
+
+  adguardhome:
+    image: adguard/adguardhome:latest
+    container_name: adguardhome
+    restart: unless-stopped
+    # Shares Tailscale's network namespace (listens only on tailscale0 and localhost)
+    network_mode: "service:tailscale"
+    volumes:
+      - ./data/adguard/work:/opt/adguardhome/work
+      - ./data/adguard/conf:/opt/adguardhome/conf
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    depends_on:
+      - tailscale
+
+  # RustDesk ID / Rendezvous Server
+  rustdesk-hbbs:
+    image: rustdesk/rustdesk-server:latest
+    container_name: rustdesk-hbbs
+    restart: unless-stopped
+    network_mode: "service:tailscale"
+    # -k _ enforces key authentication using the automatically generated key pair
+    command: hbbs -r ${RUSTDESK_RELAY_HOST:-adguard-tailscale}:21117 -k _
+    volumes:
+      - ./data/rustdesk:/root
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    depends_on:
+      - tailscale
+
+  # RustDesk Relay Server
+  rustdesk-hbbr:
+    image: rustdesk/rustdesk-server:latest
+    container_name: rustdesk-hbbr
+    restart: unless-stopped
+    network_mode: "service:tailscale"
+    command: hbbr -k _
+    volumes:
+      - ./data/rustdesk:/root
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    depends_on:
+      - tailscale

@@ -1,0 +1,5 @@
+# Environment variables
+.env
+
+# Persistent data directories
+data/
