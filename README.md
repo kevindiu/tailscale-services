@@ -141,6 +141,17 @@ Open your **[Tailscale Admin Console → Access Controls (ACLs)](https://login.t
    - Under **Settings → DNS Settings**, check **Enable DNSSEC**.
 6. **Set Rate Limiting:**
    - Set **Rate limit** to `20` or `30` rps to mitigate client query flooding.
+7. **Performance Tuning (Sub-Millisecond DNS & Fast Browsing):**
+   - **Parallel Requests:** Under *Upstream DNS servers*, select **"Parallel requests"** (queries upstream servers concurrently, returning the fastest response).
+   - **Optimistic Caching:** Under *DNS cache configuration*, check **"Optimistic caching"** (instantly serves cached records from RAM while refreshing in the background).
+8. **Recommended Filter Lists:**
+   Go to **Filters → DNS blocklists** → **Add blocklist** → **Add a custom list**:
+   - **HaGeZi Multi PRO (Gold Standard):** `https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt`
+   - **OISD Big:** `https://big.oisd.nl`
+9. **Disk Storage & Log Retention:**
+   - Under **Settings → General Settings**, change **Query log retention** from `90 days` to **`7 days`** or **`14 days`** to keep storage lightweight.
+10. **Friendly Client Names:**
+    - Under **Settings → Client settings**, map Tailscale IPs to human names (e.g. `100.83.241.44` -> `MacBook`, `100.120.203.50` -> `iPhone`) so query logs show exact device names.
 
 ---
 
@@ -171,6 +182,42 @@ On any RustDesk client connected to your Tailnet:
    - **Relay Server:** `<TAILSCALE_IP>:21117`
    - **Key:** Paste the public key string from `id_ed25519.pub`.
 3. Click **Apply**. The bottom status indicator will turn green (**Ready**).
+
+---
+
+### Step 7: (Optional) Enable Exit Node (Full VPN for Public Wi-Fi / Abroad)
+
+You can turn this same container into an exit node with zero extra containers:
+
+1. In `.env`, append `--advertise-exit-node`:
+   ```env
+   TS_EXTRA_ARGS=--advertise-tags=tag:dns-server --advertise-exit-node
+   ```
+2. Recreate the stack:
+   ```bash
+   docker compose up -d
+   ```
+3. In **[Tailscale Admin → Machines](https://login.tailscale.com/admin/machines)**:
+   - Click the three dots `...` next to `adguard-tailscale` → **Edit route settings...**
+   - Check **"Use as exit node"** and click **Save**.
+4. In your client Tailscale app (iPhone / iPad / Mac):
+   - Tap **Exit Node** → select **`adguard-tailscale`** whenever connecting to public Wi-Fi or traveling abroad.
+
+---
+
+## Troubleshooting & Apple Device Tips
+
+### Why is an Apple Device (iPhone / iPad / Mac) not blocking ads?
+1. **iCloud Private Relay is Active:**
+   - Apple proxies Safari DNS through its own servers, bypassing Tailscale and AdGuard.
+   - Go to **Settings → [Your Name] → iCloud → Private Relay** and turn it **OFF**.
+2. **Limit IP Address Tracking on Wi-Fi:**
+   - In iOS/iPadOS: **Settings → Wi-Fi → tap `(i)` next to connected network**.
+   - Toggle **"Limit IP Address Tracking"** to **OFF**.
+3. **Tailscale "Override local DNS" is OFF:**
+   - In [Tailscale Admin → DNS](https://login.tailscale.com/admin/dns), ensure **Override local DNS** is **ON**. If OFF, devices race local Wi-Fi router DNS in parallel with AdGuard.
+4. **Mac Tailscale DNS Setting:**
+   - Click the Tailscale icon in the macOS menu bar and verify **"Use Tailscale DNS Settings"** is checked.
 
 ---
 
