@@ -102,6 +102,9 @@ services:
       - ./data/antigravity:/root/.gemini/antigravity-cli:rw
       - ./antigravity_proxy.py:/app/antigravity_proxy.py:ro
     command: python3 /app/antigravity_proxy.py --host 127.0.0.1 --port 8877
+    environment:
+      - ANTIGRAVITY_CLIENT_ID=${ANTIGRAVITY_CLIENT_ID:-1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com}
+      - ANTIGRAVITY_CLIENT_SECRET=${ANTIGRAVITY_CLIENT_SECRET:-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}
     deploy:
       resources:
         limits:

@@ -47,17 +47,9 @@ from urllib.error import HTTPError, URLError
 # ──────────────────────────────────────────────────────────────────────────────
 
 # OAuth client credentials for Antigravity CLI (reverse-engineered from agy).
-# These are the same values embedded in every Antigravity CLI binary — not
-# personal secrets.  Set them via env vars if you prefer, or see README.md
-# for the default values to put in a .env file.
-CLIENT_ID = os.environ.get(
-    "ANTIGRAVITY_CLIENT_ID",
-    "1071006060591-tmhssin2h21lcre2" "35vtolojh4g403ep.apps.googleusercontent.com",
-)
-CLIENT_SECRET = os.environ.get(
-    "ANTIGRAVITY_CLIENT_SECRET",
-    "GOCSPX-K58FWR486LdL" "J1mLB8sXC4z6qDAf",
-)
+# Loaded from environment variables (ANTIGRAVITY_CLIENT_ID / ANTIGRAVITY_CLIENT_SECRET).
+CLIENT_ID = os.environ.get("ANTIGRAVITY_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("ANTIGRAVITY_CLIENT_SECRET", "")
 
 TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
