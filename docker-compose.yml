@@ -1,8 +1,10 @@
+name: tailscale-services
+
 services:
   tailscale:
     image: tailscale/tailscale:latest
     container_name: tailscale
-    hostname: ${TAILSCALE_HOSTNAME:-adguard-tailscale}
+    hostname: ${TAILSCALE_HOSTNAME:-tailscale-services}
     environment:
       - TS_AUTHKEY=${TS_AUTHKEY}
       - TS_STATE_DIR=/var/lib/tailscale
@@ -59,7 +61,7 @@ services:
     restart: unless-stopped
     network_mode: "service:tailscale"
     # -k _ enforces key authentication using the automatically generated key pair
-    command: hbbs -r ${RUSTDESK_RELAY_HOST:-adguard-tailscale}:21117 -k _
+    command: hbbs -r ${RUSTDESK_RELAY_HOST:-tailscale-services}:21117 -k _
     volumes:
       - ./data/rustdesk:/root
     deploy:
@@ -89,6 +91,37 @@ services:
     depends_on:
       - tailscale
 
+  # Hermes AI Agent (Autonomous Agent & Gateway)
+  # ISOLATION GUARANTEE: Uses a dedicated Docker named volume instead of a host bind mount,
+  # and never mounts the Docker socket (/var/run/docker.sock). The agent cannot access, read,
+  # or modify any files on the macOS host system.
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes
+    restart: unless-stopped
+    command: gateway run
+    network_mode: "service:tailscale"
+    volumes:
+      # Isolated Docker named volume: stored within Docker VM storage, zero access to /Users/...
+      - hermes_data:/opt/data
+    environment:
+      - HERMES_UID=10000
+      - HERMES_GID=10000
+      # LLM Provider Keys (populated via .env or configured interactively via 'hermes setup')
+      - OPENAI_API_KEY=${HERMES_OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${HERMES_ANTHROPIC_API_KEY:-}
+      - OPENROUTER_API_KEY=${HERMES_OPENROUTER_API_KEY:-}
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    labels:
+      - "com.centurylinklabs.watchtower.depends-on=tailscale"
+    depends_on:
+      - tailscale
+
   # Automatic image updater: checks Docker Hub for updates and updates only if a new image exists
   watchtower:
     image: containrrr/watchtower:latest
@@ -109,3 +142,9 @@ services:
       resources:
         limits:
           memory: 128M
+
+volumes:
+  # Named volume for Hermes AI Agent state (memories, sessions, skills, configurations).
+  # Managed internally by Docker, preventing any access or leakage to the macOS host filesystem.
+  hermes_data:
+
