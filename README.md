@@ -21,10 +21,10 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 |                    +-----------------------+-----------------------+                    |
 |                    |                       |                       |                    |
 |  +-----------------v-----------------+  +--v--------------------+  +--v--------------+  |
-|  |           AdGuard Home            |  |    RustDesk Server    |  | Hermes AI Agent |  |
+|  |           AdGuard Home            |  |    RustDesk Server    |  | Hermes + Proxy  |  |
 |  |  Port 53 (DNS - open to Tailnet)  |  |  hbbs: 21115, 21116   |  | Port 8642 (API) |  |
-|  |  Port 3000 / 80 (Admin ACL)       |  |  hbbr: 21117 (Relay)  |  | ./data/hermes   |  |
-|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | Host Data Mount |  |
+|  |  Port 3000 / 80 (Admin ACL)       |  |  hbbr: 21117 (Relay)  |  | Zero Mac Procs  |  |
+|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | Pure Container  |  |
 |  |  DNSSEC: Enabled                  |  |  Memory Cap: 256MB    |  | Memory Cap: 2GB |  |
 |  |  Memory Cap: 512MB                |  |                       |  |                 |  |
 |  +-----------------------------------+  +-----------------------+  +-----------------+  |
@@ -41,9 +41,11 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 ### Security Invariants
 - **No WAN / Open Resolver risk:** No ports are mapped to the host (`ports:` omitted). AdGuard Home is physically unreachable by the public internet or external port scanners.
 - **Tailscale ACL isolation:** Devices on your Tailnet can send DNS queries to port `53`, but only designated admin devices can reach the AdGuard dashboard, RustDesk ports, or Hermes Agent API.
-- **Isolated Container Boundary (Hermes AI Agent):**
-  - **Scoped Host Mount:** Hermes state (memories, sessions, skills, SQLite DBs) is stored under `./data/hermes`.
-  - **Zero Docker Socket Access:** `/var/run/docker.sock` is NOT mounted into Hermes, strictly preventing container escapes or host filesystem mounts.
+- **Isolated Container Boundary (Hermes AI Agent & Antigravity):**
+  - **Zero Host Processes:** Both Hermes and the Antigravity bridge run 100% inside Docker. No scripts or services run on your Mac.
+  - **Zero Host Connections:** Hermes communicates with the Antigravity bridge via local container loopback (`127.0.0.1:8877`), completely avoiding `host.docker.internal` or Mac network adapters.
+  - **Scoped Host Mount:** Hermes state is stored under `./data/hermes`, and Antigravity tokens are in `./data/antigravity`.
+  - **Zero Docker Socket Access:** `/var/run/docker.sock` is NOT mounted into Hermes or the proxy, strictly preventing container escapes or host filesystem mounts.
   - **Least Privilege:** Runs with `no-new-privileges:true`, unprivileged UID/GID (10000), and memory limits enforced.
 - **Zero Tagging Hassle:** No complex ACL tag configurations required. Simply click "Disable key expiry" in the Tailscale admin console for permanent, uninterrupted uptime.
 - **Built-in Exit Node:** Advertised by default (`TS_EXTRA_ARGS=--advertise-exit-node`), allowing you to use this node as a secure full VPN when traveling or on public Wi-Fi.
@@ -164,38 +166,30 @@ On any RustDesk client connected to your Tailnet:
 
 ---
 
-### Step 7: Hermes AI Agent Usage & Host Isolation
+### Step 7: Hermes AI Agent & Antigravity (Zero Mac Processes)
 
-**Hermes** is an autonomous AI agent by Nous Research capable of task execution, memory retention, and tool use.
-
-#### Storage & Isolation Model
-1. **Host Directory (`./data/hermes`):** The persistent data mount `/opt/data` is mapped to `./data/hermes` on the host, consistent with `adguard` and `rustdesk`.
-2. **No Docker Socket Mount:** The container does NOT mount `/var/run/docker.sock`. Hermes cannot command the Docker daemon to spawn privileged containers or mount host directories.
-3. **Privilege Hardening:** Runs with `no-new-privileges:true` and non-root user mapping (`HERMES_UID=10000`), bounded by a 2GB memory ceiling.
-4. **Tailscale Network Isolation:** Bound to `network_mode: "service:tailscale"`, meaning Hermes does not bind to your Mac's physical network adapters or open ports to your local LAN.
-
-#### Initial Configuration (Setup Wizard)
-To configure your LLM providers (OpenAI, Anthropic, OpenRouter, etc.) and model preferences:
-```bash
-docker compose exec -it hermes hermes setup
-```
-Credentials and configuration are saved into `./data/hermes`.
-
-Alternatively, provide API keys directly in `.env`:
-```env
-HERMES_OPENAI_API_KEY=your-openai-api-key
-HERMES_ANTHROPIC_API_KEY=your-anthropic-api-key
-HERMES_OPENROUTER_API_KEY=your-openrouter-api-key
-```
+**Hermes** runs alongside an ultra-lightweight containerized bridge (`antigravity-proxy`) that connects directly to Google Cloud Code Assist:
+- **100% Containerized:** No processes, terminal sessions, or Python scripts run on your Mac.
+- **Internal Loopback:** Hermes talks to the Antigravity bridge over `http://127.0.0.1:8877/v1` inside the shared Tailscale network namespace.
+- **Auto-Started:** When you run `docker compose up -d`, everything starts together automatically.
 
 #### Interactive Terminal Chat
-To chat directly with Hermes inside its isolated container:
 ```bash
 docker compose exec -it hermes hermes chat
 ```
 
-#### Background Gateway & Integrations
-Hermes continuously runs `gateway run` in the background. If you configure messaging connectors (Discord, Telegram, Slack) or the OpenAI-compatible API server via `hermes setup` or config files, the gateway handles them autonomously.
+#### Available Antigravity Models
+Your account has access to the latest Gemini, Claude, and GPT-OSS models via Antigravity:
+- `gemini-3.8-flash` (Default)
+- `claude-sonnet-5.5`
+- `claude-opus-5.5`
+- `gemini-4-argon`
+- `gpt-oss-120b`
+
+To switch models in Hermes:
+```bash
+docker compose exec -it hermes hermes config set model.default claude-sonnet-5.5
+```
 
 ---
 

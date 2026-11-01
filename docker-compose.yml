@@ -91,6 +91,26 @@ services:
     depends_on:
       - tailscale
 
+  # Antigravity OpenAI Bridge
+  # Runs entirely inside Docker — zero processes on your Mac, zero connection to host Mac
+  antigravity-proxy:
+    image: python:3.11-alpine
+    container_name: antigravity-proxy
+    restart: unless-stopped
+    network_mode: "service:tailscale"
+    volumes:
+      - ./data/antigravity:/root/.gemini/antigravity-cli:rw
+      - ./antigravity_proxy.py:/app/antigravity_proxy.py:ro
+    command: python3 /app/antigravity_proxy.py --host 127.0.0.1 --port 8877
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    labels:
+      - "com.centurylinklabs.watchtower.depends-on=tailscale"
+    depends_on:
+      - tailscale
+
   # Hermes AI Agent (Autonomous Agent & Gateway)
   hermes:
     image: nousresearch/hermes-agent:latest
