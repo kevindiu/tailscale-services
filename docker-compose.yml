@@ -9,7 +9,7 @@ services:
       - TS_AUTHKEY=${TS_AUTHKEY}
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
-      - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---advertise-tags=tag:dns-server}
+      - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---advertise-exit-node}
     volumes:
       - ./data/tailscale:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun
@@ -92,9 +92,6 @@ services:
       - tailscale
 
   # Hermes AI Agent (Autonomous Agent & Gateway)
-  # ISOLATION GUARANTEE: Uses a dedicated Docker named volume instead of a host bind mount,
-  # and never mounts the Docker socket (/var/run/docker.sock). The agent cannot access, read,
-  # or modify any files on the macOS host system.
   hermes:
     image: nousresearch/hermes-agent:latest
     container_name: hermes
@@ -102,8 +99,7 @@ services:
     command: gateway run
     network_mode: "service:tailscale"
     volumes:
-      # Isolated Docker named volume: stored within Docker VM storage, zero access to /Users/...
-      - hermes_data:/opt/data
+      - ./data/hermes:/opt/data
     environment:
       - HERMES_UID=10000
       - HERMES_GID=10000
@@ -142,9 +138,4 @@ services:
       resources:
         limits:
           memory: 128M
-
-volumes:
-  # Named volume for Hermes AI Agent state (memories, sessions, skills, configurations).
-  # Managed internally by Docker, preventing any access or leakage to the macOS host filesystem.
-  hermes_data:
 

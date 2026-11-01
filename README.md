@@ -13,7 +13,7 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 |  +-----------------------------------------------------------------------------------+  |
 |  |                        Tailscale Container (Network Owner)                        |  |
 |  |       IP: 100.x.y.z | Hostname: tailscale-services                                 |  |
-|  |       Tags: tag:dns-server (Key expiry disabled)                                  |  |
+|  |       Exit Node: Enabled by default | No tags required                             |  |
 |  |       Capabilities: ALL dropped, only NET_ADMIN + NET_RAW                         |  |
 |  |       Memory Cap: 256MB                                                           |  |
 |  +-----------------------------------------+-----------------------------------------+  |
@@ -23,8 +23,8 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 |  +-----------------v-----------------+  +--v--------------------+  +--v--------------+  |
 |  |           AdGuard Home            |  |    RustDesk Server    |  | Hermes AI Agent |  |
 |  |  Port 53 (DNS - open to Tailnet)  |  |  hbbs: 21115, 21116   |  | Port 8642 (API) |  |
-|  |  Port 3000 / 80 (Admin ACL)       |  |  hbbr: 21117 (Relay)  |  | Strict Sandbox  |  |
-|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | Named Volume    |  |
+|  |  Port 3000 / 80 (Admin ACL)       |  |  hbbr: 21117 (Relay)  |  | ./data/hermes   |  |
+|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | Host Data Mount |  |
 |  |  DNSSEC: Enabled                  |  |  Memory Cap: 256MB    |  | Memory Cap: 2GB |  |
 |  |  Memory Cap: 512MB                |  |                       |  |                 |  |
 |  +-----------------------------------+  +-----------------------+  +-----------------+  |
@@ -41,11 +41,12 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 ### Security Invariants
 - **No WAN / Open Resolver risk:** No ports are mapped to the host (`ports:` omitted). AdGuard Home is physically unreachable by the public internet or external port scanners.
 - **Tailscale ACL isolation:** Devices on your Tailnet can send DNS queries to port `53`, but only designated admin devices can reach the AdGuard dashboard, RustDesk ports, or Hermes Agent API.
-- **Strict Host Filesystem Isolation (Hermes AI Agent):**
-  - **Zero Host Bind Mounts:** Hermes stores state (memories, sessions, skills, SQLite DBs) in an isolated Docker named volume (`hermes_data`). On macOS, this volume lives exclusively inside the Docker VM virtual disk, preventing the agent from seeing, reading, or modifying `/Users/...` or any files on your Mac.
+- **Isolated Container Boundary (Hermes AI Agent):**
+  - **Scoped Host Mount:** Hermes state (memories, sessions, skills, SQLite DBs) is stored under `./data/hermes`.
   - **Zero Docker Socket Access:** `/var/run/docker.sock` is NOT mounted into Hermes, strictly preventing container escapes or host filesystem mounts.
   - **Least Privilege:** Runs with `no-new-privileges:true`, unprivileged UID/GID (10000), and memory limits enforced.
-- **No key expiration outages:** Tagged nodes (`tag:dns-server`) do not expire after 180 days, preventing sudden DNS blackout.
+- **Zero Tagging Hassle:** No complex ACL tag configurations required. Simply click "Disable key expiry" in the Tailscale admin console for permanent, uninterrupted uptime.
+- **Built-in Exit Node:** Advertised by default (`TS_EXTRA_ARGS=--advertise-exit-node`), allowing you to use this node as a secure full VPN when traveling or on public Wi-Fi.
 - **DNS privacy against ISP:** AdGuard resolves upstream queries using DNS-over-HTTPS (DoH) or DNS-over-TLS (DoT) with DNSSEC validation enabled.
 - **Principle of Least Privilege:** `cap_drop: ALL` with only `NET_ADMIN` and `NET_RAW` granted to Tailscale for tunnel operation. Memory limits enforced on all containers.
 
@@ -53,55 +54,18 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 
 ## Step-by-Step Setup
 
-### Step 1: Configure Tailscale ACLs & Tags
-
-Open your **[Tailscale Admin Console → Access Controls (ACLs)](https://login.tailscale.com/admin/acls)** and add:
-
-```json
-{
-  // 1. Declare the tag owner (only admins can assign this tag)
-  "tagOwners": {
-    "tag:dns-server": ["autogroup:admin"]
-  },
-
-  "acls": [
-    // 2. Allow ALL devices on your Tailnet to query DNS
-    {
-      "action": "accept",
-      "src": ["*"],
-      "proto": ["tcp", "udp"],
-      "dst": ["tag:dns-server:53"]
-    },
-
-    // 3. Allow ONLY admin devices to access AdGuard dashboard, RustDesk & Hermes
-    {
-      "action": "accept",
-      "src": ["autogroup:admin"],
-      "dst": [
-        "tag:dns-server:80",
-        "tag:dns-server:3000",
-        "tag:dns-server:8642",
-        "tag:dns-server:21115-21119"
-      ]
-    }
-  ]
-}
-```
-
----
-
-### Step 2: Generate Tagged Auth Key
+### Step 1: Generate Auth Key
 
 1. Go to **[Tailscale Admin → Settings → Keys](https://login.tailscale.com/admin/settings/keys)**.
 2. Click **Generate auth key...**:
    - Check **Reusable**.
    - Check **Pre-approved**.
-   - Select Tag: **`tag:dns-server`** (ensures key never expires).
+   - *(No tags needed!)*
 3. Copy the generated key (`tskey-auth-...`).
 
 ---
 
-### Step 3: Configure Environment & Launch Stack
+### Step 2: Configure Environment & Launch Stack
 
 1. Copy `env.example` to `.env`:
    ```bash
@@ -111,7 +75,7 @@ Open your **[Tailscale Admin Console → Access Controls (ACLs)](https://login.t
    ```env
    TS_AUTHKEY=tskey-auth-kXXXXXX-XXXXXXXXXXXXXXXX
    TAILSCALE_HOSTNAME=tailscale-services
-   TS_EXTRA_ARGS=--advertise-tags=tag:dns-server
+   TS_EXTRA_ARGS=--advertise-exit-node
    RUSTDESK_RELAY_HOST=tailscale-services
    ```
 3. Start the containers:
@@ -123,6 +87,15 @@ Open your **[Tailscale Admin Console → Access Controls (ACLs)](https://login.t
    docker compose ps
    docker compose logs -f
    ```
+
+---
+
+### Step 3: Disable Key Expiry (For 24/7 Uptime)
+
+To prevent Tailscale from disconnecting after 180 days:
+1. Go to **[Tailscale Admin → Machines](https://login.tailscale.com/admin/machines)**.
+2. Find **`tailscale-services`**.
+3. Click the three dots `...` → **Disable key expiry**.
 
 ---
 
@@ -195,8 +168,8 @@ On any RustDesk client connected to your Tailnet:
 
 **Hermes** is an autonomous AI agent by Nous Research capable of task execution, memory retention, and tool use.
 
-#### Why Hermes cannot touch files on your Mac
-1. **Docker Named Volume (`hermes_data`):** The persistent data mount `/opt/data` is backed by a named Docker volume created inside Docker's virtualized storage rather than a host path bind-mount (`./data` or `~/.hermes`). The agent has no path traversal, mount point, or visibility into `/Users/...` on macOS.
+#### Storage & Isolation Model
+1. **Host Directory (`./data/hermes`):** The persistent data mount `/opt/data` is mapped to `./data/hermes` on the host, consistent with `adguard` and `rustdesk`.
 2. **No Docker Socket Mount:** The container does NOT mount `/var/run/docker.sock`. Hermes cannot command the Docker daemon to spawn privileged containers or mount host directories.
 3. **Privilege Hardening:** Runs with `no-new-privileges:true` and non-root user mapping (`HERMES_UID=10000`), bounded by a 2GB memory ceiling.
 4. **Tailscale Network Isolation:** Bound to `network_mode: "service:tailscale"`, meaning Hermes does not bind to your Mac's physical network adapters or open ports to your local LAN.
@@ -206,7 +179,7 @@ To configure your LLM providers (OpenAI, Anthropic, OpenRouter, etc.) and model 
 ```bash
 docker compose exec -it hermes hermes setup
 ```
-Credentials and configuration are saved securely into the isolated `hermes_data` volume.
+Credentials and configuration are saved into `./data/hermes`.
 
 Alternatively, provide API keys directly in `.env`:
 ```env
@@ -226,22 +199,14 @@ Hermes continuously runs `gateway run` in the background. If you configure messa
 
 ---
 
-### Step 8: (Optional) Enable Exit Node (Full VPN for Public Wi-Fi / Abroad)
+### Step 8: Approve Exit Node in Tailscale Admin
 
-You can turn this same container into an exit node with zero extra containers:
+Because `TS_EXTRA_ARGS=--advertise-exit-node` is enabled by default, this node is already offering itself as an exit node. To activate it:
 
-1. In `.env`, append `--advertise-exit-node`:
-   ```env
-   TS_EXTRA_ARGS=--advertise-tags=tag:dns-server --advertise-exit-node
-   ```
-2. Recreate the stack:
-   ```bash
-   docker compose up -d
-   ```
-3. In **[Tailscale Admin → Machines](https://login.tailscale.com/admin/machines)**:
+1. In **[Tailscale Admin → Machines](https://login.tailscale.com/admin/machines)**:
    - Click the three dots `...` next to `tailscale-services` → **Edit route settings...**
    - Check **"Use as exit node"** and click **Save**.
-4. In your client Tailscale app (iPhone / iPad / Mac):
+2. In your client Tailscale app (iPhone / iPad / Mac):
    - Tap **Exit Node** → select **`tailscale-services`** whenever connecting to public Wi-Fi or traveling abroad.
 
 ---
