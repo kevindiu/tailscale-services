@@ -22,7 +22,7 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 |                    |                       |                       |                    |
 |  +-----------------v-----------------+  +--v--------------------+  +--v--------------+  |
 |  |           AdGuard Home            |  |    RustDesk Server    |  | Hermes + Proxy  |  |
-|  |  Port 53 (DNS - open to Tailnet)  |  |  hbbs: 21115, 21116   |  | Port 8642 (API) |  |
+|  |  Port 53 (DNS - open to Tailnet)  |  |  hbbs: 21115, 21116   |  | Port 9119 (Web)|  |
 |  |  Port 3000 / 80 (Admin ACL)       |  |  hbbr: 21117 (Relay)  |  | Zero Mac Procs  |  |
 |  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | Pure Container  |  |
 |  |  DNSSEC: Enabled                  |  |  Memory Cap: 256MB    |  | Memory Cap: 2GB |  |
@@ -35,7 +35,7 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
                                Your Private Tailscale Network
                       - All devices query DNS on port 53
                       - Only admin devices can access web dashboard (80/3000),
-                        RustDesk (21115-21119), and Hermes Agent (8642)
+                        RustDesk (21115-21119), and Hermes Web UI (9119)
 ```
 
 ### Security Invariants
@@ -172,6 +172,18 @@ On any RustDesk client connected to your Tailnet:
 - **100% Containerized:** No processes, terminal sessions, or Python scripts run on your Mac.
 - **Internal Loopback:** Hermes talks to the Antigravity bridge over `http://127.0.0.1:8877/v1` inside the shared Tailscale network namespace.
 - **Auto-Started:** When you run `docker compose up -d`, everything starts together automatically.
+
+#### Web UI / Dashboard
+You can access the full Hermes Web Dashboard directly in your browser:
+- **URL:** `http://tailscale-services:9119` (or `http://<TAILSCALE_IP>:9119`)
+- **Default Username:** `admin`
+- **Default Password:** `admin` *(configurable via `HERMES_DASHBOARD_PASSWORD` in `.env`)*
+
+Features included in the Web UI:
+- Live web chat with Hermes
+- Skills explorer & editor
+- Session history & transcript viewer
+- Platform connectors & cron jobs management
 
 #### Interactive Terminal Chat
 ```bash

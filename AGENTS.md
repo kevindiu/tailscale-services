@@ -34,7 +34,7 @@ This file documents the architecture, operational workflows, and security invari
 |            |                  |                                    |                 |            |
 |  +---------v---------+  +-----v--------------+  +------------------v--+  +-----------v---------+  |
 |  |   AdGuard Home    |  |  RustDesk Server   |  |   Hermes Agent      |  |  Antigravity Bridge |  |
-|  |  Port 53 (DNS)    |  |  hbbs: 21115-21116 |  |  Port 8642 (API)    |  |  Port 8877 (Loopback)|  |
+|  |  Port 53 (DNS)    |  |  hbbs: 21115-21116 |  |  Port 9119 (Web UI) |  |  Port 8877 (Loopback)|  |
 |  |  Port 3000 / 80   |  |  hbbr: 21117       |  |  Telegram Gateway   |  |  Google OAuth Token |  |
 |  |  (Web Dashboard)  |  |  Auth: Public Key  |  |  Plugin: antigravity|  |  No Mac processes   |  |
 |  +-------------------+  +--------------------+  +---------------------+  +---------------------+  |

@@ -105,6 +105,10 @@ services:
     environment:
       - ANTIGRAVITY_CLIENT_ID=${ANTIGRAVITY_CLIENT_ID:-1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com}
       - ANTIGRAVITY_CLIENT_SECRET=${ANTIGRAVITY_CLIENT_SECRET:-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}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     deploy:
       resources:
         limits:
@@ -130,8 +134,22 @@ services:
       - OPENAI_API_KEY=${HERMES_OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${HERMES_ANTHROPIC_API_KEY:-}
       - OPENROUTER_API_KEY=${HERMES_OPENROUTER_API_KEY:-}
+      # Hermes Web Dashboard (Accessible over Tailscale at http://tailscale-services:9119)
+      - HERMES_DASHBOARD=${HERMES_DASHBOARD:-true}
+      - HERMES_DASHBOARD_HOST=0.0.0.0
+      - HERMES_DASHBOARD_PORT=9119
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${HERMES_DASHBOARD_USER:-admin}
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${HERMES_DASHBOARD_PASSWORD:-admin}
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     deploy:
       resources:
         limits:
