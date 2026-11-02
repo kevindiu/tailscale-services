@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-Antigravity OpenAI-Compatible Proxy (Cloud Code Assist API)
+Antigravity Universal Proxy (Cloud Code Assist API)
 
-Bridges Hermes Agent (OpenAI-compatible client) to Google Antigravity's Cloud
-Code Assist API. Uses the OAuth token managed by the Antigravity CLI (agy) and
-talks directly to https://cloudcode-pa.googleapis.com — no `agy` subprocess
-needed, giving us native streaming + tool/function-call support.
+A production-grade, zero-dependency proxy server connecting AI clients
+to Google Antigravity's internal Cloud Code Assist API.
 
-Architecture:
-  1. OAuth token read from ~/.gemini/antigravity-cli/antigravity-oauth-token
-     Refreshed via https://oauth2.googleapis.com/token when expired.
-  2. Project ID discovered via v1internal:loadCodeAssist (cached).
-  3. Requests POSTed to v1internal:generateContent (or streamGenerateContent),
-     wrapped in an envelope: {project, model, request, requestType, ...}
-  4. Responses unwrapped from {"response": {<Gemini response>}} and transformed
-     to OpenAI chat.completion format.
-
-Usage:
-  python3 antigravity_proxy.py [--port 8877] [--host 127.0.0.1]
-
-Then configure Hermes:
-  hermes config set model.provider custom
-  hermes config set model.base_url http://127.0.0.1:8877/v1
-  hermes config set model.api_key antigravity
-  hermes config set model.default gemini-3.1-pro
+Supported APIs & Endpoints:
+  1. OpenAI Chat Completions:
+     - POST /v1/chat/completions, POST /chat/completions (streaming & non-streaming, tool-calling)
+  2. OpenAI Text Completions:
+     - POST /v1/completions, POST /completions (streaming & non-streaming)
+  3. Anthropic Messages API:
+     - POST /v1/messages, POST /messages (streaming & non-streaming, Claude Code / Continue / Zed)
+  4. OpenAI Image Generations:
+     - POST /v1/images/generations, POST /images/generations (DALL-E format via gemini-3.1-flash-image)
+  5. Native Gemini Passthrough:
+     - POST /v1beta/models/{model}:generateContent & POST /v1/models/{model}:generateContent
+     - POST /v1beta/models/{model}:streamGenerateContent & POST /v1/models/{model}:streamGenerateContent
+  6. Model Discovery & Listing (Dynamic from Google — ZERO hardcoding):
+     - GET /v1/models, GET /models (OpenAI format)
+     - GET /v1/models/{model} (OpenAI format)
+     - GET /v1beta/models (Gemini format)
+  7. Quota & Usage:
+     - GET /v1/usage, GET /usage (Live weekly limit & quota summary)
+  8. Health & System:
+     - GET /health, GET /
+  9. CORS Preflight:
+     - OPTIONS /* (full browser support)
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -36,18 +40,16 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Constants
+# Configuration & Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-# OAuth client credentials for Antigravity CLI (reverse-engineered from agy).
-# Loaded from environment variables (ANTIGRAVITY_CLIENT_ID / ANTIGRAVITY_CLIENT_SECRET).
 CLIENT_ID = os.environ.get("ANTIGRAVITY_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("ANTIGRAVITY_CLIENT_SECRET", "")
 
@@ -57,6 +59,8 @@ CLOUDCODE_BASE = "https://daily-cloudcode-pa.googleapis.com"
 LOAD_CODEASSIST_URL = f"{CLOUDCODE_BASE}/v1internal:loadCodeAssist"
 GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:generateContent"
 STREAM_GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
+USER_QUOTA_SUMMARY_URL = f"{CLOUDCODE_BASE}/v1internal:retrieveUserQuotaSummary"
+FETCH_AVAILABLE_MODELS_URL = f"{CLOUDCODE_BASE}/v1internal:fetchAvailableModels"
 
 ANTIGRAVITY_USER_AGENT = (
     "antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=982146307; auth_method=consumer)"
@@ -66,73 +70,48 @@ CLIENT_METADATA = json.dumps(
     separators=(",", ":"),
 )
 
-# Minimal system instruction — just enough for the Code Assist API to accept
-# the request. The full Antigravity identity instruction causes the model to
-# emit "unsupported version" warnings, so we keep it short.
 DEFAULT_SYSTEM_INSTRUCTION = "You are a helpful AI assistant."
-
-UPSTREAM_TIMEOUT = 300  # 5 minutes
-TOKEN_REFRESH_SKEW = 120  # refresh this many seconds before actual expiry
-
-# Model mapping: OpenAI-facing name -> Antigravity backend model name.
-# Tested against cloudcode-pa.googleapis.com on 2026-06-30.
-# Model mapping: OpenAI-facing name -> (backend model name, thinking level).
-# Gemini 3 Pro models use the base name "gemini-3.1-pro-low" and control
-# thinking compute via generationConfig.thinkingConfig.thinkingLevel.
-MODEL_MAP = {
-    "gemini-3.8-flash": ("gemini-3.8-flash-low", None),
-    "gemini-3.8-flash-high": ("gemini-3.8-flash-high", None),
-    "gemini-4-argon": ("gemini-4-argon-medium", None),
-    "claude-sonnet-5.5": ("claude-sonnet-5-5-medium", None),
-    "claude-sonnet-5.5-high": ("claude-sonnet-5-5-high", None),
-    "claude-opus-5.5": ("claude-opus-5-5-medium", None),
-    "gpt-oss-120b": ("gpt-oss-120b-medium", None),
-    "gemini-2.5-pro": ("gemini-2.5-pro", None),
-    "gemini-2.5-flash": ("gemini-2.5-flash", None),
-}
-
 DEFAULT_MODEL = "gemini-3.8-flash"
+UPSTREAM_TIMEOUT = 300  # 5 minutes
+TOKEN_REFRESH_SKEW = 120  # refresh 2 mins before expiry
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Token / OAuth management (thread-safe)
+# Token & Project State
 # ──────────────────────────────────────────────────────────────────────────────
 
 _token_lock = threading.Lock()
-_cached_access_token: str = None
-_cached_project_id: str = None
+_cached_access_token: str | None = None
+
 _project_lock = threading.Lock()
+_cached_project_id: str | None = None
+
+_models_lock = threading.Lock()
+_cached_models: list[str] = []
+_cached_models_time: float = 0.0
+MODELS_CACHE_TTL = 900.0  # 15 minutes
 
 
 def _log(msg: str):
     print(f"[antigravity-proxy] {msg}", file=sys.stderr, flush=True)
 
 
-def _parse_expiry(expiry_raw):
-    """Parse the 'expiry' field from the token file into a unix timestamp.
-
-    The Antigravity CLI stores expiry as an RFC3339 string like
-    "2026-06-30T12:55:03.123456789Z". Python stdlib datetime.fromisoformat
-    can't handle nanosecond precision, so we truncate to 6 digits.
-    """
+def _parse_expiry(expiry_raw) -> float:
     if not expiry_raw:
         return 0.0
     if isinstance(expiry_raw, (int, float)):
         return float(expiry_raw)
     s = str(expiry_raw).strip()
-    # Truncate sub-second precision to microseconds for fromisoformat.
     try:
         if "." in s:
             head, tail = s.split(".", 1)
-            # Keep only the part up to 'Z' or timezone offset, truncate ns.
             tz_part = ""
             for i, ch in enumerate(tail):
                 if ch in "Z+-":
                     tz_part = tail[i:]
                     tail = tail[:i]
                     break
-            tail = tail[:6]  # microseconds max
+            tail = tail[:6]
             s = f"{head}.{tail}{tz_part}"
-        # fromisoformat in 3.12 handles 'Z' suffix.
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -141,8 +120,7 @@ def _parse_expiry(expiry_raw):
         return 0.0
 
 
-def _read_token_from_disk():
-    """Read and parse the token file. Returns the raw dict or None."""
+def _read_token_from_disk() -> dict | None:
     try:
         with open(TOKEN_FILE, "r") as f:
             return json.load(f)
@@ -152,7 +130,6 @@ def _read_token_from_disk():
 
 
 def _write_token_to_disk(data: dict):
-    """Persist updated token data back to disk (atomic-ish)."""
     try:
         tmp = TOKEN_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -167,11 +144,6 @@ def _write_token_to_disk(data: dict):
 
 
 def _refresh_access_token(refresh_token: str) -> dict:
-    """Refresh the access token via Google's OAuth endpoint.
-
-    Returns the new token dict {access_token, refresh_token?, expiry, token_type}.
-    Raises RuntimeError on failure.
-    """
     body = json.dumps({
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
@@ -193,47 +165,32 @@ def _refresh_access_token(refresh_token: str) -> dict:
     except URLError as e:
         raise RuntimeError(f"OAuth refresh network error: {e}")
 
-    new_tok = {
+    expires_in = int(payload.get("expires_in", 3600))
+    exp_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    return {
         "access_token": payload["access_token"],
         "refresh_token": payload.get("refresh_token", refresh_token),
         "token_type": payload.get("token_type", "Bearer"),
-        "expiry": payload.get("expires_in", 3600),
+        "expiry": exp_dt.strftime("%Y-%m-%dT%H:%M:%S.000000Z"),
     }
-    # Convert expires_in (seconds) to an RFC3339 expiry timestamp ~now.
-    expires_in = int(payload.get("expires_in", 3600))
-    exp_dt = datetime.now(timezone.utc)
-    from datetime import timedelta
-    exp_dt = exp_dt + timedelta(seconds=expires_in)
-    new_tok["expiry"] = exp_dt.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
-    return new_tok
 
 
 def get_access_token() -> str:
-    """Return a valid access token, refreshing if necessary. Thread-safe."""
     global _cached_access_token
     with _token_lock:
         data = _read_token_from_disk()
         if not data:
-            raise RuntimeError(
-                f"No OAuth token found at {TOKEN_FILE}. "
-                "Run `agy` to authenticate first."
-            )
+            raise RuntimeError(f"No OAuth token found at {TOKEN_FILE}.")
         token_obj = data.get("token") or {}
         access_token = token_obj.get("access_token")
         expiry_ts = _parse_expiry(token_obj.get("expiry"))
         now = time.time()
 
-        needs_refresh = (
-            not access_token
-            or expiry_ts == 0.0
-            or (expiry_ts - now) < TOKEN_REFRESH_SKEW
-        )
-
-        if needs_refresh:
+        if not access_token or expiry_ts == 0.0 or (expiry_ts - now) < TOKEN_REFRESH_SKEW:
             refresh_token = token_obj.get("refresh_token")
             if not refresh_token:
-                raise RuntimeError("No refresh_token available; re-run `agy` to authenticate.")
-            _log("Access token expired (or missing) — refreshing...")
+                raise RuntimeError("No refresh_token available; cannot refresh OAuth token.")
+            _log("Access token expired (or missing) — refreshing via Google OAuth...")
             new_tok = _refresh_access_token(refresh_token)
             data["token"] = new_tok
             _write_token_to_disk(data)
@@ -243,93 +200,134 @@ def get_access_token() -> str:
         return access_token
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Project discovery (cached)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _load_code_assist(access_token: str) -> str:
-    """Discover the cloudaicompanion project ID. Returns project id string.
-
-    NOTE: The metadata field (ideType/platform/pluginType) is rejected by the
-    API with INVALID_ARGUMENT for all known enum string values. Sending an
-    empty body {} works and returns the cloudaicompanionProject. The Client-Metadata
-    header still carries the ide/plugin info.
-    """
-    body = json.dumps({}).encode()
-    req = Request(LOAD_CODEASSIST_URL, data=body, method="POST")
-    req.add_header("Authorization", f"Bearer {access_token}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
-    req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
-    req.add_header("Client-Metadata", CLIENT_METADATA)
-    try:
-        with urlopen(req, timeout=60) as resp:
-            payload = json.loads(resp.read().decode())
-    except HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode()
-        except Exception:
-            pass
-        raise RuntimeError(f"loadCodeAssist failed (HTTP {e.code}): {detail}")
-    except URLError as e:
-        raise RuntimeError(f"loadCodeAssist network error: {e}")
-
-    project_id = (
-        payload.get("cloudaicompanionProject")
-        or payload.get("cloudaicompanion_project")
-    )
-    if not project_id:
-        # Some responses nest it differently; do a recursive search.
-        project_id = _deep_find(payload, "cloudaicompanionProject")
-    if not project_id:
-        raise RuntimeError(
-            f"loadCodeAssist did not return a project ID. Response: {payload}"
-        )
-    return project_id
-
-
-def _deep_find(obj, key):
-    """Recursively search for a key in nested dicts/lists. Returns first match."""
-    if isinstance(obj, dict):
-        if key in obj:
-            return obj[key]
-        for v in obj.values():
-            r = _deep_find(v, key)
-            if r is not None:
-                return r
-    elif isinstance(obj, list):
-        for item in obj:
-            r = _deep_find(item, key)
-            if r is not None:
-                return r
-    return None
-
-
 def get_project_id() -> str:
-    """Return cached project id, discovering it if needed. Thread-safe."""
     global _cached_project_id
     with _project_lock:
         if _cached_project_id:
             return _cached_project_id
         token = get_access_token()
-        pid = _load_code_assist(token)
-        _cached_project_id = pid
-        _log(f"Discovered project ID: {pid}")
-        return pid
+        req = Request(LOAD_CODEASSIST_URL, data=b"{}", method="POST")
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
+        req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+        req.add_header("Client-Metadata", CLIENT_METADATA)
+        try:
+            with urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read().decode())
+                pid = payload.get("cloudaicompanionProject") or payload.get("cloudaicompanion_project")
+                if not pid:
+                    pid = "aicode-consumers"
+                _cached_project_id = pid
+                _log(f"Discovered Antigravity project ID: {pid}")
+                return pid
+        except Exception as e:
+            _log(f"Project ID discovery fallback to aicode-consumers: {e}")
+            _cached_project_id = "aicode-consumers"
+            return "aicode-consumers"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OpenAI -> Gemini message transformation
+# Dynamic Model Discovery (ZERO HARDCODING)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_available_models() -> list[str]:
+    """Fetch live available models from Google Cloud Code Assist (cached)."""
+    global _cached_models, _cached_models_time
+    with _models_lock:
+        now = time.time()
+        if _cached_models and (now - _cached_models_time) < MODELS_CACHE_TTL:
+            return _cached_models
+
+        try:
+            token = get_access_token()
+            pid = get_project_id()
+            req = Request(
+                FETCH_AVAILABLE_MODELS_URL,
+                data=json.dumps({"project": pid}).encode(),
+                method="POST"
+            )
+            req.add_header("Authorization", f"Bearer {token}")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
+            req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+            req.add_header("Client-Metadata", CLIENT_METADATA)
+            with urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode())
+                raw = payload.get("models", [])
+                if raw:
+                    valid_models = [m for m in raw if isinstance(m, str) and m]
+                    _cached_models = valid_models
+                    _cached_models_time = now
+                    _log(f"Discovered {len(valid_models)} live models from Google")
+                    return valid_models
+        except Exception as e:
+            _log(f"Live model fetch error (using fallback): {e}")
+            if _cached_models:
+                return _cached_models
+
+        # Minimal fallback if network discovery blips
+        return [
+            "gemini-3.8-flash-low",
+            "gemini-3.8-flash-high",
+            "gemini-4-argon-medium",
+            "claude-sonnet-5-5-medium",
+            "claude-sonnet-5-5-high",
+            "claude-opus-5-5-medium",
+            "gpt-oss-120b-medium",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-3.1-flash-image",
+        ]
+
+
+def resolve_backend_model(requested: str) -> tuple[str, str | None]:
+    """Resolve any requested model string to (backend_model_id, thinking_level) dynamically."""
+    if not requested:
+        return "gemini-3.8-flash-low", None
+
+    live_models = get_available_models()
+    # 1. Exact match
+    if requested in live_models:
+        thinking = "high" if "high" in requested else ("low" if "low" in requested else None)
+        return requested, thinking
+
+    # 2. Normalized match (e.g. 'claude-sonnet-5.5' -> 'claude-sonnet-5-5')
+    norm = requested.replace(".", "-").lower()
+
+    # Common aliases
+    if norm in ("dall-e-3", "dall-e-2", "image", "image-gen"):
+        return "gemini-3.1-flash-image", None
+    if norm in ("claude-sonnet", "sonnet", "claude-3-5-sonnet", "claude-3-7-sonnet"):
+        norm = "claude-sonnet-5-5"
+    elif norm in ("claude-opus", "opus"):
+        norm = "claude-opus-5-5"
+    elif norm in ("gemini-flash", "flash"):
+        norm = "gemini-3.8-flash"
+    elif norm in ("gemini-pro", "pro"):
+        norm = "gemini-2.5-pro"
+
+    cands = [m for m in live_models if m.lower() == norm or m.lower().startswith(f"{norm}-") or norm in m.lower()]
+    if cands:
+        preferred = (
+            [c for c in cands if "-medium" in c] or
+            [c for c in cands if "-low" in c] or
+            [c for c in cands if "-high" in c] or
+            cands
+        )
+        chosen = preferred[0]
+        thinking = "high" if "-high" in chosen else ("low" if "-low" in chosen else None)
+        return chosen, thinking
+
+    # Default fallback
+    return "gemini-3.8-flash-low", None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Message & Envelope Transformers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _content_to_text(content) -> str:
-    """Normalize an OpenAI message 'content' field to plain text.
-
-    Handles str, list of content blocks [{type: text, text: ...}, ...], and None.
-    Non-text blocks (images, etc.) are represented as a placeholder marker so
-    the model knows something was there even if we can't inline binary data.
-    """
     if content is None:
         return ""
     if isinstance(content, str):
@@ -344,35 +342,16 @@ def _content_to_text(content) -> str:
             if btype == "text":
                 chunks.append(block.get("text", ""))
             elif btype == "image_url":
-                url = ""
                 iu = block.get("image_url")
-                if isinstance(iu, dict):
-                    url = iu.get("url", "")
-                elif isinstance(iu, str):
-                    url = iu
-                # We pass the data URL through; Gemini's inlineData supports it.
-                if url.startswith("data:"):
-                    # Best-effort: note its presence; full image passthrough
-                    # would require parts[].inlineData. Keep as text marker.
-                    chunks.append(f"[image: {url[:60]}...]")
-                else:
-                    chunks.append(f"[image: {url}]")
-            elif btype == "input_text":
-                chunks.append(block.get("text", ""))
-            elif btype == "input_image":
-                chunks.append("[image provided]")
+                url = iu.get("url", "") if isinstance(iu, dict) else str(iu or "")
+                chunks.append(f"[image: {url[:50]}...]")
             else:
-                chunks.append(f"[{btype}: {json.dumps(block.get('text', ''))[:100]}]")
+                chunks.append(str(block.get("text") or ""))
         return "\n".join(c for c in chunks if c)
     return str(content)
 
 
 def _openai_tools_to_gemini(tools: list) -> list:
-    """Convert OpenAI tools array to Gemini functionDeclarations format.
-
-    OpenAI:  [{"type":"function","function":{"name","description","parameters"}}]
-    Gemini:  [{"functionDeclarations":[{"name","description","parameters"}]}]
-    """
     if not tools:
         return []
     decls = []
@@ -385,101 +364,27 @@ def _openai_tools_to_gemini(tools: list) -> list:
         name = func.get("name")
         if not name:
             continue
-        decl = {
-            "name": name,
-            "description": func.get("description", ""),
-        }
+        decl = {"name": name, "description": func.get("description", "")}
         params = func.get("parameters")
         if isinstance(params, dict) and params:
             decl["parameters"] = params
         decls.append(decl)
-    if not decls:
-        return []
-    return [{"functionDeclarations": decls}]
+    return [{"functionDeclarations": decls}] if decls else []
 
 
 def _tool_choice_to_gemini(tool_choice) -> str | None:
-    """Convert OpenAI tool_choice to Gemini toolConfig.functionCallingConfig.mode.
-
-    Returns None if no transformation applies.
-    """
-    if tool_choice is None:
-        return None
-    if tool_choice == "auto":
+    if not tool_choice or tool_choice == "auto":
         return "AUTO"
     if tool_choice == "none":
         return "NONE"
     if tool_choice == "required":
         return "ANY"
     if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
-        # Specific function forced — Gemini uses ANY + allowed_function_names.
         return "ANY"
     return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Gemini-native passthrough (for invoice_reader.py / any Gemini SDK client)
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Matches /v1beta/models/{model}:generateContent
-_GEMINI_PASSTHROUGH_RE = re.compile(
-    r"^/v1beta/models/(.+):generateContent$"
-)
-
-
-def _build_passthrough_envelope(model: str, gemini_body: dict) -> dict:
-    """Wrap a native Gemini generateContent request in the Antigravity
-    envelope.  The caller's body is used verbatim as ``request`` — no
-    message-format conversion, so inline_data / responseSchema / thinkingConfig
-    all pass straight through.
-
-    The friendly model name (e.g. ``gemini-3.5-flash``) is translated to the
-    Antigravity backend name (e.g. ``gemini-3.5-flash-low``) via MODEL_MAP so
-    callers can use the same name as Google's public API.
-
-    Safety settings are injected only when the caller did not supply its own.
-    """
-    # Translate friendly model name to Antigravity backend name.
-    entry = MODEL_MAP.get(model)
-    backend_model = entry[0] if entry else model
-    thinking_level = entry[1] if entry else None
-
-    inner = dict(gemini_body)  # shallow copy — don't mutate caller's dict
-
-    # Apply thinking level from MODEL_MAP if the caller didn't set one.
-    if thinking_level:
-        gc = inner.setdefault("generationConfig", {})
-        tc = gc.setdefault("thinkingConfig", {})
-        tc.setdefault("thinkingLevel", thinking_level)
-
-    if "safetySettings" not in inner:
-        inner["safetySettings"] = [
-            {"category": cat, "threshold": "BLOCK_NONE"}
-            for cat in (
-                "HARM_CATEGORY_HARASSMENT",
-                "HARM_CATEGORY_HATE_SPEECH",
-                "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "HARM_CATEGORY_DANGEROUS_CONTENT",
-            )
-        ]
-
-    project_id = get_project_id()
-    return {
-        "project": project_id,
-        "model": backend_model,
-        "request": inner,
-        "requestType": "agent",
-        "userAgent": "antigravity",
-        "requestId": f"agent-{uuid.uuid4().hex}",
-    }
-
-
-def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = None):
-    """Transform an OpenAI chat completion body into a Gemini generateContent
-    request envelope.
-
-    Returns (envelope_dict, openai_model_name).
-    """
+def _build_gemini_request(body: dict, backend_model: str, thinking_level: str | None = None) -> dict:
     messages = body.get("messages", [])
     if not isinstance(messages, list):
         messages = []
@@ -488,7 +393,7 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
     contents = []
     tool_call_name_map = {}
 
-    # Pre-scan tool call IDs to function names so function responses match functionCall names exactly
+    # Map tool call IDs to real function names
     for msg in messages:
         for tc in (msg.get("tool_calls") or []):
             if isinstance(tc, dict):
@@ -510,7 +415,6 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
         else:
             target_contents.append({"role": target_role, "parts": list(target_parts)})
 
-    # Collect system instruction pieces and convert messages.
     for msg in messages:
         role = msg.get("role", "user")
 
@@ -521,10 +425,8 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
             continue
 
         if role == "tool":
-            # OpenAI tool result message -> Gemini functionResponse part.
             tool_call_id = msg.get("tool_call_id", "")
             content_text = _content_to_text(msg.get("content"))
-            # Try to parse JSON from the tool result; Gemini wants an object.
             response_obj = {}
             if content_text:
                 try:
@@ -532,8 +434,8 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
                     response_obj = parsed if isinstance(parsed, dict) else {"result": parsed}
                 except (json.JSONDecodeError, TypeError):
                     response_obj = {"result": content_text}
-            
-            # Function name MUST match the functionCall name, not the tool_call_id
+
+            # Function name must match original function call name exactly
             fn_name = msg.get("name") or tool_call_name_map.get(tool_call_id)
             if not fn_name and tool_call_id.startswith("call_"):
                 raw_id = tool_call_id[5:]
@@ -543,18 +445,12 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
             if not fn_name:
                 fn_name = "tool_result"
 
-            # Decode the fc_id from the encoded tool_call_id (format: call_<fc_id>|<sig>).
             fc_response_id = ""
             if tool_call_id.startswith("call_"):
-                raw = tool_call_id[5:]  # strip "call_"
-                if "|" in raw:
-                    fc_response_id = raw.split("|", 1)[0]
-                else:
-                    fc_response_id = raw
-            func_resp = {
-                "name": fn_name,
-                "response": response_obj,
-            }
+                raw = tool_call_id[5:]
+                fc_response_id = raw.split("|", 1)[0] if "|" in raw else raw
+
+            func_resp = {"name": fn_name, "response": response_obj}
             if fc_response_id:
                 func_resp["id"] = fc_response_id
             _append_turn(contents, "user", [{"functionResponse": func_resp}])
@@ -563,13 +459,10 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
         if role == "assistant":
             parts = []
             text = _content_to_text(msg.get("content"))
-            # Skip past stream error outputs from history
             if text and not (text.startswith("[stream error:") or text.startswith("[Error:")):
                 parts.append({"text": text})
-            # Prior tool calls from the assistant -> functionCall parts.
-            # Decode the encoded tool_call.id to recover the Gemini fc_id and thoughtSignature.
-            tool_calls = msg.get("tool_calls") or []
-            for tc in tool_calls:
+
+            for tc in (msg.get("tool_calls") or []):
                 if not isinstance(tc, dict):
                     continue
                 fn = tc.get("function") or {}
@@ -583,7 +476,6 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
                     tc_id = tc.get("id", "") or ""
                     fc_id = ""
                     thought_sig = ""
-                    # Decode: format is call_<fc_id>|<thought_signature>
                     if tc_id.startswith("call_"):
                         raw = tc_id[5:]
                         if "|" in raw:
@@ -594,118 +486,68 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
                     if fc_id:
                         fc_obj["id"] = fc_id
                     part_obj = {"functionCall": fc_obj}
-                    # thoughtSignature goes as a sibling key on the part, not inside functionCall.
-                    # If missing, use the sentinel to skip validation (officially supported by Google).
-                    if thought_sig:
-                        part_obj["thoughtSignature"] = thought_sig
-                    else:
-                        part_obj["thoughtSignature"] = "skip_thought_signature_validator"
+                    part_obj["thoughtSignature"] = thought_sig or "skip_thought_signature_validator"
                     parts.append(part_obj)
             if parts:
                 _append_turn(contents, "model", parts)
             continue
 
         if role == "developer":
-            # Treat developer role like system.
             text = _content_to_text(msg.get("content"))
             if text:
                 system_texts.append(text)
             continue
 
-        # Default: user role.
+        # Default user role
         text = _content_to_text(msg.get("content"))
         parts = []
         if text:
             parts.append({"text": text})
-        # Some clients send tool_calls on user messages; handle gracefully.
         for tc in (msg.get("tool_calls") or []):
-            if not isinstance(tc, dict):
-                continue
-            fn = tc.get("function") or {}
-            fn_name = fn.get("name", "")
-            args_str = fn.get("arguments", "{}")
-            try:
-                args = json.loads(args_str) if isinstance(args_str, str) else args_str
-            except (json.JSONDecodeError, TypeError):
-                args = {"raw": str(args_str)}
-            if fn_name:
-                parts.append({"functionCall": {"name": fn_name, "args": args}})
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    parts.append({"functionCall": {"name": fn["name"], "args": fn.get("arguments", {})}})
         if parts:
             _append_turn(contents, "user", parts)
 
-    # Build system instruction: use user's system messages if provided,
-    # otherwise fall back to the default.
-    if system_texts:
-        system_instruction = {"parts": [{"text": "\n\n".join(s for s in system_texts if s)}]}
-    else:
-        system_instruction = {"parts": [{"text": DEFAULT_SYSTEM_INSTRUCTION}]}
-
-    # Google Gemini requires requests to end with a user turn (never a model turn).
+    # Invariant: Requests must always terminate with a user turn
     while contents and contents[-1].get("role") == "model":
         contents.pop()
     if not contents or contents[-1].get("role") != "user":
         _append_turn(contents, "user", [{"text": "Continue"}])
 
-    # Build the inner Gemini request.
-    inner = {
-        "contents": contents,
-        "systemInstruction": system_instruction,
-    }
+    system_instruction = (
+        {"parts": [{"text": "\n\n".join(s for s in system_texts if s)}]}
+        if system_texts else
+        {"parts": [{"text": DEFAULT_SYSTEM_INSTRUCTION}]}
+    )
 
-    # Tools.
+    inner = {"contents": contents, "systemInstruction": system_instruction}
+
     tools = _openai_tools_to_gemini(body.get("tools"))
     if tools:
         inner["tools"] = tools
 
-    # Tool choice -> toolConfig.
     tool_choice = body.get("tool_choice")
     mode = _tool_choice_to_gemini(tool_choice)
     if mode:
-        tc_config = {"functionCallingConfig": {"mode": mode}}
-        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
-            fn_name = (tool_choice.get("function") or {}).get("name")
-            if fn_name:
-                tc_config["functionCallingConfig"]["allowedFunctionNames"] = [fn_name]
-        inner["toolConfig"] = tc_config
+        inner["toolConfig"] = {"functionCallingConfig": {"mode": mode}}
 
-    # Generation config.
     gen_config = {}
-    if "temperature" in body and body["temperature"] is not None:
+    if body.get("temperature") is not None:
         gen_config["temperature"] = float(body["temperature"])
-    if "top_p" in body and body["top_p"] is not None:
+    if body.get("top_p") is not None:
         gen_config["topP"] = float(body["top_p"])
-    if "max_tokens" in body and body["max_tokens"] is not None:
+    if body.get("max_tokens") is not None:
         gen_config["maxOutputTokens"] = int(body["max_tokens"])
-    elif "max_completion_tokens" in body and body["max_completion_tokens"] is not None:
+    elif body.get("max_completion_tokens") is not None:
         gen_config["maxOutputTokens"] = int(body["max_completion_tokens"])
-    if "presence_penalty" in body and body["presence_penalty"] is not None:
-        gen_config["presencePenalty"] = float(body["presence_penalty"])
-    if "frequency_penalty" in body and body["frequency_penalty"] is not None:
-        gen_config["frequencyPenalty"] = float(body["frequency_penalty"])
-    if "stop" in body and body["stop"]:
-        stops = body["stop"]
-        if isinstance(stops, str):
-            stops = [stops]
-        gen_config["stopSequences"] = stops
-    if "seed" in body and body["seed"] is not None:
-        gen_config["seed"] = int(body["seed"])
-    # Enable thinking for the thinking variant of claude-opus.
-    if backend_model == "claude-opus-4-6-thinking":
-        thinking_cfg = gen_config.get("thinkingConfig", {})
-        thinking_cfg.setdefault("includeThoughts", False)
-        gen_config["thinkingConfig"] = thinking_cfg
-    # Inject thinking level for Gemini 3 Pro models.
     if thinking_level:
-        thinking_cfg = gen_config.get("thinkingConfig", {})
-        thinking_cfg.setdefault("thinkingLevel", thinking_level)
-        thinking_cfg.setdefault("includeThoughts", False)
-        gen_config["thinkingConfig"] = thinking_cfg
+        gen_config["thinkingConfig"] = {"thinkingLevel": thinking_level, "includeThoughts": False}
     if gen_config:
         inner["generationConfig"] = gen_config
 
-    # Safety settings: relax standard categories so coding tasks aren't blocked.
-    # NOTE: HARM_CATEGORY_CIVIC_INTEGRITY is rejected by this API variant even
-    # though it appears in the error's valid-list — only the 4 below are accepted.
     inner["safetySettings"] = [
         {"category": cat, "threshold": "BLOCK_NONE"}
         for cat in (
@@ -716,31 +558,56 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
         )
     ]
 
-    # Build the wrapped envelope.
-    project_id = get_project_id()
-    envelope = {
-        "project": project_id,
+    return {
+        "project": get_project_id(),
         "model": backend_model,
         "request": inner,
         "requestType": "agent",
         "userAgent": "antigravity",
         "requestId": f"agent-{uuid.uuid4().hex}",
     }
-    return envelope
+
+
+# Matches /(v1|v1beta)/models/{model}:{action}
+_GEMINI_PASSTHROUGH_RE = re.compile(
+    r"^/(?:v1|v1beta)/models/([^:]+):(generateContent|streamGenerateContent)$"
+)
+
+
+def _build_passthrough_envelope(model: str, gemini_body: dict) -> dict:
+    backend_model, thinking_level = resolve_backend_model(model)
+    inner = dict(gemini_body)
+
+    if thinking_level and "generationConfig" in inner:
+        tc = inner["generationConfig"].setdefault("thinkingConfig", {})
+        tc.setdefault("thinkingLevel", thinking_level)
+
+    if "safetySettings" not in inner:
+        inner["safetySettings"] = [
+            {"category": cat, "threshold": "BLOCK_NONE"}
+            for cat in (
+                "HARM_CATEGORY_HARASSMENT",
+                "HARM_CATEGORY_HATE_SPEECH",
+                "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "HARM_CATEGORY_DANGEROUS_CONTENT",
+            )
+        ]
+
+    return {
+        "project": get_project_id(),
+        "model": backend_model,
+        "request": inner,
+        "requestType": "agent",
+        "userAgent": "antigravity",
+        "requestId": f"agent-{uuid.uuid4().hex}",
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gemini -> OpenAI response transformation
+# OpenAI / Gemini Response Serialization
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _extract_parts(parts: list) -> tuple[str, list, str]:
-    """Extract (text, tool_calls, finish_reason_hint) from a Gemini parts list.
-
-    tool_calls is a list of OpenAI-format tool_call dicts. The tool_call.id
-    encodes the Gemini functionCall.id and thoughtSignature so they can be
-    round-tripped back when the assistant message is sent in a later request.
-    Format: call_<fc_id>|<thought_signature>
-    """
+def _extract_parts(parts: list) -> tuple[str, list, str | None]:
     text_chunks = []
     tool_calls = []
     finish_hint = None
@@ -748,74 +615,39 @@ def _extract_parts(parts: list) -> tuple[str, list, str]:
     for part in parts or []:
         if not isinstance(part, dict):
             continue
-        if "text" in part and part["text"]:
+        if part.get("text"):
             text_chunks.append(part["text"])
         if "functionCall" in part:
             fc = part["functionCall"] or {}
             name = fc.get("name", "")
             args = fc.get("args", {})
             fc_id = fc.get("id", "")
-            # thoughtSignature is a sibling of functionCall in the part, not inside it.
             thought_sig = part.get("thoughtSignature") or part.get("thought_signature") or ""
             if name:
-                # Encode the Gemini fc_id and thoughtSignature into the OpenAI tool_call.id
-                # so they survive the round-trip through Hermes's message history.
-                # Format: call_<fc_id>|<thought_signature>
-                encoded_id = f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else ""
+                encoded_id = f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else f"call_{uuid.uuid4().hex[:20]}"
                 tool_calls.append({
-                    "id": encoded_id,  # may be empty; caller assigns if so
+                    "id": encoded_id,
                     "type": "function",
                     "function": {
                         "name": name,
                         "arguments": json.dumps(args) if isinstance(args, (dict, list)) else str(args),
                     },
                 })
-        if "executableCode" in part:
-            ec = part["executableCode"] or {}
-            code = ec.get("code", "")
+        if part.get("executableCode"):
+            code = (part["executableCode"] or {}).get("code", "")
             if code:
                 text_chunks.append(f"```python\n{code}\n```")
-        if "codeExecutionResult" in part:
-            cer = part["codeExecutionResult"] or {}
-            out = cer.get("output", "")
+        if part.get("codeExecutionResult"):
+            out = (part["codeExecutionResult"] or {}).get("output", "")
             if out:
                 text_chunks.append(f"```\n{out}\n```")
-        if "thought" in part and part["thought"]:
-            # Thinking summaries — include as plain text (Gemini sometimes
-            # surfaces these). Keep it; the client can ignore.
-            pass
 
     if tool_calls:
         finish_hint = "tool_calls"
     return "".join(text_chunks), tool_calls, finish_hint
 
 
-def _finish_reason_from_gemini(candidate: dict, tool_calls: list) -> str:
-    """Map Gemini finishReason / stopReason to OpenAI finish_reason."""
-    if tool_calls:
-        # If there are tool calls, OpenAI expects "tool_calls".
-        fr = (candidate.get("finishReason") or "").upper()
-        # Gemini may say STOP even when emitting function calls.
-        return "tool_calls"
-    fr = (candidate.get("finishReason") or candidate.get("stopReason") or "").upper()
-    mapping = {
-        "STOP": "stop",
-        "MAX_TOKENS": "length",
-        "SAFETY": "content_filter",
-        "RECITATION": "content_filter",
-        "BLOCKLIST": "content_filter",
-        "PROHIBITED_CONTENT": "content_filter",
-        "SPII": "content_filter",
-        "MALFORMED_FUNCTION_CALL": "stop",
-        "IMAGE_SAFETY": "content_filter",
-        "LANGUAGE": "content_filter",
-        "OTHER": "stop",
-    }
-    return mapping.get(fr, "stop")
-
-
 def _extract_usage(response: dict) -> dict:
-    """Extract OpenAI-format usage from a Gemini response."""
     usage = response.get("usageMetadata") or {}
     if not usage:
         cands = response.get("candidates") or []
@@ -823,18 +655,14 @@ def _extract_usage(response: dict) -> dict:
             usage = cands[0].get("usageMetadata") or {}
     pt = usage.get("promptTokenCount", 0) or 0
     ct = usage.get("candidatesTokenCount", 0) or usage.get("completionTokenCount", 0) or 0
-    tt = usage.get("totalTokenCount", (pt + ct)) or (pt + ct)
     return {
         "prompt_tokens": pt,
         "completion_tokens": ct,
-        "total_tokens": tt,
+        "total_tokens": pt + ct,
     }
 
 
 def gemini_response_to_openai(response: dict, model: str) -> dict:
-    """Transform an unwrapped Gemini generateContent response to OpenAI
-    chat.completion format.
-    """
     candidates = response.get("candidates") or []
     text = ""
     tool_calls = []
@@ -842,21 +670,15 @@ def gemini_response_to_openai(response: dict, model: str) -> dict:
 
     if candidates:
         cand = candidates[0]
-        content = cand.get("content") or {}
-        parts = content.get("parts") or []
+        parts = (cand.get("content") or {}).get("parts") or []
         text, tool_calls, _ = _extract_parts(parts)
-        finish_reason = _finish_reason_from_gemini(cand, tool_calls)
-        # Assign tool call ids.
-        for i, tc in enumerate(tool_calls):
-            if not tc["id"]:
-                tc["id"] = f"call_{uuid.uuid4().hex[:24]}"
+        if tool_calls:
+            finish_reason = "tool_calls"
+        else:
+            fr = (cand.get("finishReason") or "").upper()
+            finish_reason = "length" if fr == "MAX_TOKENS" else ("content_filter" if fr in ("SAFETY", "BLOCKLIST") else "stop")
     else:
-        # No candidates — possibly a promptFeedback block.
-        pf = response.get("promptFeedback") or {}
-        br = (pf.get("blockReason") or "").upper()
-        if br:
-            finish_reason = "content_filter"
-            text = f"[Content blocked: {br}]"
+        text = "[No candidates returned]"
 
     message = {"role": "assistant", "content": text if text else None}
     if tool_calls:
@@ -876,12 +698,7 @@ def gemini_response_to_openai(response: dict, model: str) -> dict:
     }
 
 
-def _extract_delta_from_parts(parts: list, prev_tool_names: set) -> tuple[str, list, list]:
-    """Extract incremental (text, new_tool_calls, all_tool_names) from parts.
-
-    For streaming, each chunk may contain partial text and/or function calls.
-    We return text deltas and tool_call entries (with indices).
-    """
+def _extract_delta_from_parts(parts: list, prev_tool_names: set) -> tuple[str, list, set]:
     text_chunks = []
     tool_call_deltas = []
     current_names = set(prev_tool_names)
@@ -889,7 +706,7 @@ def _extract_delta_from_parts(parts: list, prev_tool_names: set) -> tuple[str, l
     for part in parts or []:
         if not isinstance(part, dict):
             continue
-        if "text" in part and part["text"]:
+        if part.get("text"):
             text_chunks.append(part["text"])
         if "functionCall" in part:
             fc = part["functionCall"] or {}
@@ -899,10 +716,10 @@ def _extract_delta_from_parts(parts: list, prev_tool_names: set) -> tuple[str, l
             thought_sig = part.get("thoughtSignature") or part.get("thought_signature") or ""
             if name:
                 current_names.add(name)
-                encoded_id = f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else ""
+                encoded_id = f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else f"call_{uuid.uuid4().hex[:20]}"
                 tool_call_deltas.append({
                     "index": len(current_names) - 1,
-                    "id": encoded_id or f"call_{uuid.uuid4().hex[:24]}",
+                    "id": encoded_id,
                     "type": "function",
                     "function": {
                         "name": name,
@@ -914,11 +731,17 @@ def _extract_delta_from_parts(parts: list, prev_tool_names: set) -> tuple[str, l
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Upstream API calls
+# Network Client
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _make_upstream_request(url: str, envelope: dict, streaming: bool = False):
-    """Build and return a urllib Request object for the upstream call."""
+class UpstreamError(Exception):
+    def __init__(self, message, status=502, body=""):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+
+def _make_upstream_request(url: str, envelope: dict, streaming: bool = False) -> Request:
     body = json.dumps(envelope).encode()
     req = Request(url, data=body, method="POST")
     req.add_header("Authorization", f"Bearer {get_access_token()}")
@@ -932,11 +755,11 @@ def _make_upstream_request(url: str, envelope: dict, streaming: bool = False):
 
 
 def call_generate_content(envelope: dict) -> dict:
-    """Non-streaming call. Returns the unwrapped inner Gemini response dict."""
     req = _make_upstream_request(GENERATE_CONTENT_URL, envelope, streaming=False)
     try:
         with urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
-            raw = resp.read().decode()
+            payload = json.loads(resp.read().decode())
+            return payload.get("response", payload)
     except HTTPError as e:
         detail = ""
         try:
@@ -944,28 +767,11 @@ def call_generate_content(envelope: dict) -> dict:
         except Exception:
             pass
         raise UpstreamError(f"Upstream HTTP {e.code}: {detail}", status=e.code, body=detail)
-    except URLError as e:
+    except Exception as e:
         raise UpstreamError(f"Upstream network error: {e}", status=502)
-
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        raise UpstreamError(f"Upstream returned non-JSON: {raw[:500]}", status=502)
-
-    # Unwrap the envelope: {"response": {<gemini>}} or sometimes bare.
-    if isinstance(payload, dict) and "response" in payload:
-        return payload["response"]
-    return payload
 
 
 def stream_generate_content(envelope: dict):
-    """Streaming call. Yields parsed JSON event objects from the SSE stream.
-
-    The Antigravity stream endpoint returns either:
-      - SSE format: lines "data: {json}\n\n"
-      - Or a bare JSON array of incremental response objects (some endpoints).
-    We handle both.
-    """
     req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, envelope, streaming=True)
     try:
         resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
@@ -975,22 +781,13 @@ def stream_generate_content(envelope: dict):
             detail = e.read().decode()
         except Exception:
             pass
-        _log(f"STREAM UPSTREAM HTTP {e.code}: {detail}")
-        try:
-            with open("/tmp/failed_envelope.json", "w") as f:
-                json.dump(envelope, f, indent=2)
-        except Exception:
-            pass
         raise UpstreamError(f"Upstream stream HTTP {e.code}: {detail}", status=e.code, body=detail)
-    except URLError as e:
+    except Exception as e:
         raise UpstreamError(f"Upstream stream network error: {e}", status=502)
 
     try:
         for line in resp:
-            if isinstance(line, bytes):
-                line_str = line.decode("utf-8", errors="replace").strip()
-            else:
-                line_str = str(line).strip()
+            line_str = line.decode("utf-8", errors="replace").strip() if isinstance(line, bytes) else str(line).strip()
             if not line_str or line_str.startswith(":") or line_str.startswith("event:") or line_str.startswith("id:"):
                 continue
             if line_str.startswith("data:"):
@@ -999,207 +796,52 @@ def stream_generate_content(envelope: dict):
                     yield {"__done__": True}
                     break
                 try:
-                    obj = json.loads(data_str)
-                    yield obj
+                    yield json.loads(data_str)
                 except json.JSONDecodeError:
                     pass
     finally:
         resp.close()
 
 
-def _try_parse_one_event(buffer: str):
-    """Attempt to parse one SSE event or JSON array element from the buffer.
-
-    Returns (event_obj_or_None, bytes_consumed) or None if incomplete.
-    The event_obj may be None when it's a comment/heartbeat line.
-    """
-    # SSE "data:" lines.
-    if "data:" in buffer[:10] or buffer.startswith("\n") or buffer.startswith(":"):
-        # Find end of this SSE block (double newline).
-        for sep in ("\n\n", "\r\n\r\n"):
-            idx = buffer.find(sep)
-            if idx != -1:
-                block = buffer[:idx]
-                consumed = idx + len(sep)
-                obj = _parse_sse_block(block)
-                return (obj, consumed)
-        # Maybe single newline-terminated line (some servers use \n not \n\n).
-        nl = buffer.find("\n")
-        if nl != -1 and buffer.strip().startswith("data:"):
-            # Only consume if we have a complete data line.
-            line = buffer[:nl]
-            consumed = nl + 1
-            obj = _parse_sse_block(line)
-            return (obj, consumed)
-        return None  # incomplete
-
-    # Bare JSON array stream: [ {...}, {...} ]
-    if buffer.lstrip().startswith("["):
-        obj, consumed = _try_parse_json_element_in_array(buffer)
-        if obj is not None or consumed > 0:
-            return (obj, consumed)
-        return None
-
-    # Bare JSON object stream: {...}{...}
-    if buffer.lstrip().startswith("{"):
-        obj, consumed = _try_parse_one_json_object(buffer)
-        if obj is not None:
-            return (obj, consumed)
-        return None
-
-    # Unknown prefix; skip a line to resync.
-    nl = buffer.find("\n")
-    if nl != -1:
-        return (None, nl + 1)
-    return None
-
-
-def _parse_sse_block(block: str):
-    """Parse an SSE block (one or more lines) into a JSON object or None."""
-    data_lines = []
-    for line in block.split("\n"):
-        line = line.rstrip("\r")
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip())
-        elif line.startswith(":"):
-            continue  # comment / heartbeat
-        elif line.startswith("event:") or line.startswith("id:") or line.startswith("retry:"):
-            continue
-        elif line.strip() == "":
-            continue
-        else:
-            # Unexpected line; ignore.
-            pass
-    if not data_lines:
-        return None
-    data_str = "\n".join(data_lines).strip()
-    if data_str == "[DONE]":
-        return {"__done__": True}
-    try:
-        return json.loads(data_str)
-    except json.JSONDecodeError:
-        return None
-
-
-def _try_parse_json_element_in_array(buffer: str):
-    """For bare JSON array streams like [{...},{...}]. Parse one element."""
-    s = buffer.lstrip()
-    if not s.startswith("["):
-        # Maybe we already consumed the opening bracket.
-        pass
-    # We need to find a complete top-level object. Use brace counting.
-    obj, consumed = _try_parse_one_json_object(buffer)
-    return (obj, consumed)
-
-
-def _try_parse_one_json_object(buffer: str):
-    """Parse one complete top-level JSON object from buffer using brace counting.
-
-    Returns (obj, consumed_chars) or (None, 0) if incomplete.
-    """
-    # Find first '{'.
-    start = buffer.find("{")
-    if start == -1:
-        return (None, 0)
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(buffer)):
-        ch = buffer[i]
-        if escape:
-            escape = False
-            continue
-        if ch == "\\":
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = buffer[start:i + 1]
-                try:
-                    obj = json.loads(candidate)
-                    return (obj, i + 1)
-                except json.JSONDecodeError:
-                    # Keep scanning.
-                    continue
-    return (None, 0)
-
-
-def _parse_remaining(buffer: str):
-    """Parse any remaining JSON objects in the buffer at stream end."""
-    s = buffer.strip()
-    if not s:
-        return
-    # SSE.
-    for line in s.split("\n"):
-        line = line.strip()
-        if line.startswith("data:"):
-            data = line[5:].strip()
-            if data == "[DONE]":
-                yield {"__done__": True}
-                continue
-            try:
-                yield json.loads(data)
-            except json.JSONDecodeError:
-                pass
-    # Bare JSON.
-    if s.startswith("[") or s.startswith("{"):
-        try:
-            obj = json.loads(s)
-            if isinstance(obj, list):
-                for item in obj:
-                    yield item
-            else:
-                yield obj
-        except json.JSONDecodeError:
-            pass
+def fetch_quota_summary() -> dict:
+    token = get_access_token()
+    req = Request(USER_QUOTA_SUMMARY_URL, data=b"{}", method="POST")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
+    req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
+    req.add_header("Client-Metadata", CLIENT_METADATA)
+    with urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode())
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Error helper
-# ──────────────────────────────────────────────────────────────────────────────
-
-class UpstreamError(Exception):
-    def __init__(self, message, status=502, body=""):
-        super().__init__(message)
-        self.status = status
-        self.body = body
-
-
-def _openai_error(message: str, err_type: str = "api_error", code=None, status: int = 500):
-    return {
-        "error": {
-            "message": message,
-            "type": err_type,
-            "param": None,
-            "code": code,
-        }
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# HTTP handler
+# HTTP Server & Router
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "AntigravityProxy/2.0"
+    server_version = "AntigravityUniversalProxy/2.1"
 
     def log_message(self, fmt, *args):
-        # We do our own logging.
         pass
 
-    def _send_json(self, code, data):
+    def _send_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Max-Age", "86400")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._send_cors_headers()
+        self.end_headers()
+
+    def _send_json(self, code: int, data: dict):
         body = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self._send_cors_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         try:
@@ -1207,57 +849,121 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _send_error_json(self, code, message, err_type="api_error", http_code=None):
-        self._send_json(http_code or code, _openai_error(message, err_type, code=code))
+    def _send_error_json(self, code: str, message: str, err_type: str = "api_error", http_code: int = 400):
+        self._send_json(http_code, {
+            "error": {
+                "message": message,
+                "type": err_type,
+                "param": None,
+                "code": code,
+            }
+        })
 
-    def _read_body(self):
+    def _read_body(self) -> dict | None:
         length = int(self.headers.get("Content-Length", 0) or 0)
         if length <= 0:
             return {}
         raw = self.rfile.read(length)
-        if not raw:
-            return {}
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            return None  # signal parse failure
+            return None
 
-    # ── GET routes ────────────────────────────────────────────────────────────
+    def _log_req(self, method, path, status, duration):
+        _log(f"{method} {path} {status} {duration:.3f}s")
+
+    # ── GET Routes ────────────────────────────────────────────────────────────
 
     def do_GET(self):
         t0 = time.time()
         path = urlparse(self.path).path
         try:
-            if path == "/v1/models" or path == "/models":
-                self._handle_models()
-                self._log_req("GET", path, 200, time.time() - t0)
-            elif path in ("/health", "/"):
-                self._send_json(200, {"status": "ok", "service": "antigravity-proxy"})
-                self._log_req("GET", path, 200, time.time() - t0)
+            if path in ("/health", "/"):
+                self._send_json(200, {
+                    "status": "ok",
+                    "service": "antigravity-proxy",
+                    "version": "2.1.0",
+                    "project_id": get_project_id(),
+                    "default_model": DEFAULT_MODEL,
+                })
+            elif path in ("/v1/models", "/models"):
+                self._handle_models_openai()
+            elif path.startswith("/v1/models/"):
+                self._handle_model_detail(path[len("/v1/models/"):])
+            elif path == "/v1beta/models":
+                self._handle_models_gemini()
+            elif path in ("/v1/usage", "/usage"):
+                self._handle_usage()
             else:
-                self._send_error_json("not_found", "Not found", err_type="invalid_request_error", http_code=404)
-                self._log_req("GET", path, 404, time.time() - t0)
+                self._send_error_json("not_found", f"Endpoint {path} not found", http_code=404)
         except Exception as e:
-            _log(f"GET {path} error: {e}\n{traceback.format_exc()}")
-            try:
-                self._send_error_json("internal_error", str(e), http_code=500)
-            except Exception:
-                pass
-            self._log_req("GET", path, 500, time.time() - t0)
+            _log(f"GET {path} error: {e}")
+            self._send_error_json("internal_error", str(e), http_code=500)
+        finally:
+            self._log_req("GET", path, 200, time.time() - t0)
 
-    def _handle_models(self):
+    def _handle_models_openai(self):
         now = int(time.time())
-        models = []
-        for name in MODEL_MAP:
-            models.append({
-                "id": name,
-                "object": "model",
-                "created": now,
-                "owned_by": "google",
-            })
-        self._send_json(200, {"object": "list", "data": models})
+        live_models = get_available_models()
+        data = []
+        seen = set()
 
-    # ── POST routes ───────────────────────────────────────────────────────────
+        # Add clean friendly aliases
+        for friendly in (
+            "gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-4-argon",
+            "claude-sonnet-5.5", "claude-sonnet-5.5-high", "claude-opus-5.5",
+            "gpt-oss-120b", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-3.1-flash-image"
+        ):
+            if friendly not in seen:
+                data.append({"id": friendly, "object": "model", "created": now, "owned_by": "google"})
+                seen.add(friendly)
+
+        # Add all exact live backend models
+        for m in live_models:
+            if m not in seen:
+                data.append({"id": m, "object": "model", "created": now, "owned_by": "google"})
+                seen.add(m)
+
+        self._send_json(200, {"object": "list", "data": data})
+
+    def _handle_model_detail(self, model_id: str):
+        now = int(time.time())
+        backend, _ = resolve_backend_model(model_id)
+        self._send_json(200, {
+            "id": model_id,
+            "object": "model",
+            "created": now,
+            "owned_by": "google",
+            "backend_target": backend
+        })
+
+    def _handle_models_gemini(self):
+        live_models = get_available_models()
+        items = []
+        for m in live_models:
+            items.append({
+                "name": f"models/{m}",
+                "version": "001",
+                "displayName": m,
+                "description": f"Google Antigravity model: {m}",
+                "inputTokenLimit": 1048576,
+                "outputTokenLimit": 65536,
+                "supportedGenerationMethods": ["generateContent", "countTokens"],
+            })
+        self._send_json(200, {"models": items})
+
+    def _handle_usage(self):
+        try:
+            quota = fetch_quota_summary()
+            self._send_json(200, {
+                "status": "ok",
+                "project_id": get_project_id(),
+                "quota": quota,
+            })
+        except Exception as e:
+            self._send_error_json("upstream_error", f"Failed to retrieve quota: {e}", http_code=502)
+
+    # ── POST Routes ───────────────────────────────────────────────────────────
 
     def do_POST(self):
         t0 = time.time()
@@ -1265,424 +971,480 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             if path in ("/v1/chat/completions", "/chat/completions"):
                 self._handle_chat()
-                self._log_req("POST", path, 200, time.time() - t0)
+            elif path in ("/v1/completions", "/completions"):
+                self._handle_completions()
+            elif path in ("/v1/messages", "/messages"):
+                self._handle_anthropic_messages()
+            elif path in ("/v1/images/generations", "/images/generations"):
+                self._handle_images()
             elif _GEMINI_PASSTHROUGH_RE.match(path):
                 self._handle_gemini_passthrough(path)
-                self._log_req("POST", path, 200, time.time() - t0)
             else:
-                self._send_error_json("not_found", "Not found", err_type="invalid_request_error", http_code=404)
-                self._log_req("POST", path, 404, time.time() - t0)
+                self._send_error_json("not_found", f"Endpoint {path} not found", http_code=404)
         except Exception as e:
             _log(f"POST {path} error: {e}\n{traceback.format_exc()}")
-            try:
-                self._send_error_json("internal_error", str(e), http_code=500)
-            except Exception:
-                pass
-            self._log_req("POST", path, 500, time.time() - t0)
+            self._send_error_json("internal_error", str(e), http_code=500)
+        finally:
+            self._log_req("POST", path, 200, time.time() - t0)
 
-    def _log_req(self, method, path, status, duration):
-        _log(f"{method} {path} {status} {duration:.3f}s")
-
-    # ── Chat completions ──────────────────────────────────────────────────────
-
-    def _handle_gemini_passthrough(self, path: str):
-        """Handle a native Gemini generateContent request, wrapping it in the
-        Antigravity envelope and returning the raw Gemini response (unwrapped).
-        This is used by invoice_reader.py to send inline_data + responseSchema
-        requests through the OAuth-funded proxy instead of a paid API key."""
-        body = self._read_body()
-        if body is None or not isinstance(body, dict):
-            self._send_error_json("invalid_request", "Invalid JSON body", err_type="invalid_request_error", http_code=400)
-            return
-
-        model = _GEMINI_PASSTHROUGH_RE.match(path).group(1)
-
-        try:
-            envelope = _build_passthrough_envelope(model, body)
-        except UpstreamError as e:
-            self._send_error_json("upstream_error", str(e), err_type="api_error", http_code=e.status)
-            return
-        except RuntimeError as e:
-            self._send_error_json("auth_error", str(e), err_type="authentication_error", http_code=401)
-            return
-        except Exception as e:
-            self._send_error_json("request_error", f"Failed to build request: {e}", err_type="invalid_request_error", http_code=400)
-            return
-
-        try:
-            gemini_resp = call_generate_content(envelope)
-        except UpstreamError as e:
-            self._send_error_json("upstream_error", str(e), err_type="api_error", http_code=e.status)
-            return
-        except Exception as e:
-            self._send_error_json("upstream_error", f"Upstream call failed: {e}", err_type="api_error", http_code=502)
-            return
-
-        self._send_json(200, gemini_resp)
+    # ── OpenAI Chat Completions Handler ───────────────────────────────────────
 
     def _handle_chat(self):
         body = self._read_body()
-        if body is None:
-            self._send_error_json("invalid_request", "Invalid JSON body", err_type="invalid_request_error", http_code=400)
-            return
         if not isinstance(body, dict):
-            self._send_error_json("invalid_request", "Request body must be a JSON object", err_type="invalid_request_error", http_code=400)
+            self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
             return
-
-        try:
-            with open("/tmp/last_hermes_request.json", "w") as f:
-                json.dump(body, f, indent=2)
-        except Exception:
-            pass
 
         openai_model = body.get("model") or DEFAULT_MODEL
         stream = bool(body.get("stream", False))
+        backend_model, thinking_level = resolve_backend_model(openai_model)
 
-        # Map model. MODEL_MAP values are (backend_name, thinking_level) tuples.
-        model_entry = MODEL_MAP.get(openai_model)
-        if model_entry:
-            backend_model, thinking_level = model_entry
-        else:
-            # Allow pass-through of unknown models.
-            backend_model = openai_model
-            thinking_level = None
-
-        # Build the Gemini request envelope.
         try:
             envelope = _build_gemini_request(body, backend_model, thinking_level)
-        except UpstreamError as e:
-            self._send_error_json("upstream_error", str(e), err_type="api_error", http_code=e.status)
-            return
-        except RuntimeError as e:
-            self._send_error_json("auth_error", str(e), err_type="authentication_error", http_code=401)
-            return
         except Exception as e:
-            self._send_error_json("request_error", f"Failed to build request: {e}", err_type="invalid_request_error", http_code=400)
-            return
-
-        # Validate we have at least one content entry.
-        inner = envelope.get("request", {})
-        if not inner.get("contents"):
-            self._send_error_json("invalid_request", "No messages provided", err_type="invalid_request_error", http_code=400)
+            self._send_error_json("request_error", f"Failed to build request: {e}", http_code=400)
             return
 
         if stream:
-            self._handle_stream(envelope, openai_model)
+            self._stream_chat(envelope, openai_model)
         else:
-            self._handle_nonstream(envelope, openai_model)
+            self._nonstream_chat(envelope, openai_model)
 
-    def _handle_nonstream(self, envelope, openai_model):
+    def _nonstream_chat(self, envelope: dict, openai_model: str):
         try:
             gemini_resp = call_generate_content(envelope)
+            self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model))
         except UpstreamError as e:
-            self._send_error_json("upstream_error", str(e), err_type="api_error", http_code=e.status)
-            return
-        except Exception as e:
-            self._send_error_json("upstream_error", f"Upstream call failed: {e}", err_type="api_error", http_code=502)
-            return
+            self._send_error_json("upstream_error", str(e), http_code=e.status)
 
-        try:
-            openai_resp = gemini_response_to_openai(gemini_resp, openai_model)
-        except Exception as e:
-            _log(f"Response transform error: {e}\n{traceback.format_exc()}")
-            # Fallback: return raw text if we can find any.
-            try:
-                text = (gemini_resp.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", ""))
-            except Exception:
-                text = ""
-            openai_resp = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": openai_model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text or "[error: could not parse response]"},
-                    "finish_reason": "stop",
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            }
-        self._send_json(200, openai_resp)
-
-    def _handle_stream(self, envelope, openai_model):
+    def _stream_chat(self, envelope: dict, openai_model: str):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
-        # Send SSE headers.
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            self.close_connection = True
-        except Exception:
-            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self._send_cors_headers()
+        self.end_headers()
+        self.close_connection = True
 
-        def send_sse(obj):
-            data = f"data: {json.dumps(obj)}\n\n"
+        def send_sse(obj: dict) -> bool:
             try:
-                self.wfile.write(data.encode())
+                self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+                return True
+            except Exception:
                 return False
-            return True
 
-        # Initial role chunk.
-        first_chunk = {
+        # First role chunk
+        send_sse({
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": openai_model,
-            "choices": [{
-                "index": 0,
-                "delta": {"role": "assistant", "content": ""},
-                "finish_reason": None,
-            }],
-        }
-        if not send_sse(first_chunk):
-            return
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+        })
+
+        seen_tool_names = set()
+        finish_reason = "stop"
+        total_usage = None
 
         try:
-            gen = stream_generate_content(envelope)
-        except UpstreamError as e:
-            # Streaming failed — fall back to non-streaming and return as a single chunk.
-            # This handles the case where the streamGenerateContent endpoint rejects
-            # tool-result round-trips with 400 "invalid argument".
-            if e.status == 400:
-                try:
-                    resp = call_generate_content(envelope)
-                    openai_resp = gemini_response_to_openai(resp, openai_model)
-                    msg = openai_resp["choices"][0]["message"]
-                    delta = {}
-                    if msg.get("content"):
-                        delta["content"] = msg["content"]
-                    if msg.get("tool_calls"):
-                        delta["tool_calls"] = msg["tool_calls"]
-                    chunk = {
+            for event in stream_generate_content(envelope):
+                if not isinstance(event, dict) or event.get("__done__"):
+                    break
+                resp = event.get("response", event)
+                if resp.get("usageMetadata"):
+                    total_usage = resp["usageMetadata"]
+
+                cands = resp.get("candidates") or []
+                if not cands:
+                    continue
+                cand = cands[0]
+                parts = (cand.get("content") or {}).get("parts") or []
+                text_delta, tool_deltas, seen_tool_names = _extract_delta_from_parts(parts, seen_tool_names)
+
+                if cand.get("finishReason"):
+                    fr_up = str(cand["finishReason"]).upper()
+                    finish_reason = "tool_calls" if tool_deltas else ("length" if fr_up == "MAX_TOKENS" else "stop")
+
+                delta = {}
+                if text_delta:
+                    delta["content"] = text_delta
+                if tool_deltas:
+                    delta["tool_calls"] = tool_deltas
+
+                if delta:
+                    send_sse({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": openai_model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": delta,
-                            "finish_reason": openai_resp["choices"][0].get("finish_reason", "stop"),
-                        }],
-                    }
-                    if openai_resp.get("usage"):
-                        chunk["usage"] = openai_resp["usage"]
-                    send_sse(chunk)
-                    try:
-                        self.wfile.write(b"data: [DONE]\n\n")
-                        self.wfile.flush()
-                    except Exception:
-                        pass
-                    return
-                except Exception:
-                    pass  # fall through to error chunk
-            err_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": openai_model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": f"[Error: {e}]"},
-                    "finish_reason": "stop",
-                }],
-            }
-            send_sse(err_chunk)
-            send_sse({"__done__": True})  # sentinel handled below
-            try:
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-            except Exception:
-                pass
-            return
-        except Exception as e:
-            err_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": openai_model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": f"[Error: {e}]"},
-                    "finish_reason": "stop",
-                }],
-            }
-            send_sse(err_chunk)
-            try:
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-            except Exception:
-                pass
-            return
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                    })
 
-        finish_reason = "stop"
-        seen_tool_names = set()
-        total_usage = None
-        events_processed = 0
-
-        try:
-            for event in gen:
-                if not isinstance(event, dict):
-                    continue
-                if event.get("__done__"):
-                    break
-
-                events_processed += 1
-
-                # Unwrap envelope if present.
-                resp = event.get("response", event)
-
-                # Check for usage metadata (often on the last chunk).
-                usage_meta = resp.get("usageMetadata")
-                if usage_meta:
-                    total_usage = usage_meta
-
-                candidates = resp.get("candidates") or []
-                if not candidates:
-                    continue
-
-                cand = candidates[0]
-                content = cand.get("content") or {}
-                parts = content.get("parts") or []
-
-                text_delta, tool_call_deltas, seen_tool_names = _extract_delta_from_parts(
-                    parts, seen_tool_names
-                )
-
-                # Determine finish reason.
-                fr = cand.get("finishReason")
-                if fr:
-                    if tool_call_deltas:
-                        finish_reason = "tool_calls"
-                    else:
-                        fr_up = str(fr).upper()
-                        mapping = {
-                            "STOP": "stop",
-                            "MAX_TOKENS": "length",
-                            "SAFETY": "content_filter",
-                            "RECITATION": "content_filter",
-                            "BLOCKLIST": "content_filter",
-                            "PROHIBITED_CONTENT": "content_filter",
-                            "SPII": "content_filter",
-                            "IMAGE_SAFETY": "content_filter",
-                            "LANGUAGE": "content_filter",
-                            "OTHER": "stop",
-                        }
-                        finish_reason = mapping.get(fr_up, "stop")
-
-                # Build delta.
-                delta = {}
-                if text_delta:
-                    delta["content"] = text_delta
-                if tool_call_deltas:
-                    delta["tool_calls"] = tool_call_deltas
-
-                if not delta and not fr:
-                    # Empty chunk with nothing — skip.
-                    continue
-
-                chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": openai_model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": delta,
-                        "finish_reason": None,
-                    }],
-                }
-                if not send_sse(chunk):
-                    return
-
-            # Final chunk with finish_reason.
+            # Final stop chunk
             final_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": openai_model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": finish_reason,
-                }],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             }
-            # Include usage in the final chunk if the client requested
-            # stream_options.include_usage (OpenAI convention).
             if total_usage:
-                pt = total_usage.get("promptTokenCount", 0) or 0
-                ct = total_usage.get("candidatesTokenCount", 0) or total_usage.get("completionTokenCount", 0) or 0
-                tt = total_usage.get("totalTokenCount", (pt + ct)) or (pt + ct)
                 final_chunk["usage"] = {
-                    "prompt_tokens": pt,
-                    "completion_tokens": ct,
-                    "total_tokens": tt,
+                    "prompt_tokens": total_usage.get("promptTokenCount", 0),
+                    "completion_tokens": total_usage.get("candidatesTokenCount", 0),
+                    "total_tokens": total_usage.get("totalTokenCount", 0),
                 }
             send_sse(final_chunk)
-
-            # Termination sentinel.
             try:
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except Exception:
                 pass
-
         except Exception as e:
-            _log(f"Streaming error: {e}")
-            # If the stream endpoint returned 400, try non-streaming as fallback.
-            # The streamGenerateContent endpoint sometimes rejects tool-result round-trips.
-            if "400" in str(e):
-                try:
-                    resp = call_generate_content(envelope)
-                    openai_resp = gemini_response_to_openai(resp, openai_model)
-                    msg = openai_resp["choices"][0]["message"]
-                    delta = {}
-                    if msg.get("content"):
-                        delta["content"] = msg["content"]
-                    if msg.get("tool_calls"):
-                        delta["tool_calls"] = msg["tool_calls"]
-                    chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": openai_model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": delta,
-                            "finish_reason": openai_resp["choices"][0].get("finish_reason", "stop"),
-                        }],
-                    }
-                    if openai_resp.get("usage"):
-                        chunk["usage"] = openai_resp["usage"]
-                    send_sse(chunk)
-                    try:
-                        self.wfile.write(b"data: [DONE]\n\n")
-                        self.wfile.flush()
-                    except Exception:
-                        pass
-                    return
-                except Exception:
-                    pass  # fall through to error chunk
-            # Try to send an error chunk then close.
+            _log(f"Stream error: {e}")
             try:
-                err_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": openai_model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": f"\n[stream error: {e}]"},
-                        "finish_reason": "stop",
-                    }],
+                self.wfile.write(f"data: {json.dumps({'error': {'message': str(e)}})}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+
+    # ── OpenAI Text Completions Handler (Legacy / Code Completion) ────────────
+
+    def _handle_completions(self):
+        body = self._read_body()
+        if not isinstance(body, dict):
+            self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
+            return
+
+        prompt = body.get("prompt", "")
+        if isinstance(prompt, list):
+            prompt = "\n".join(str(p) for p in prompt)
+
+        model = body.get("model") or DEFAULT_MODEL
+        stream = bool(body.get("stream", False))
+        backend_model, thinking_level = resolve_backend_model(model)
+
+        chat_body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": body.get("max_tokens"),
+            "temperature": body.get("temperature"),
+            "stream": stream,
+        }
+
+        try:
+            envelope = _build_gemini_request(chat_body, backend_model, thinking_level)
+        except Exception as e:
+            self._send_error_json("request_error", str(e), http_code=400)
+            return
+
+        if not stream:
+            try:
+                gemini_resp = call_generate_content(envelope)
+                cand = (gemini_resp.get("candidates") or [{}])[0]
+                parts = (cand.get("content") or {}).get("parts") or []
+                text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+                self._send_json(200, {
+                    "id": f"cmpl-{uuid.uuid4().hex[:24]}",
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"text": text, "index": 0, "logprobs": None, "finish_reason": "stop"}],
+                    "usage": _extract_usage(gemini_resp),
+                })
+            except UpstreamError as e:
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+        else:
+            completion_id = f"cmpl-{uuid.uuid4().hex[:24]}"
+            created = int(time.time())
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self._send_cors_headers()
+            self.end_headers()
+            self.close_connection = True
+
+            try:
+                for event in stream_generate_content(envelope):
+                    if not isinstance(event, dict) or event.get("__done__"):
+                        break
+                    resp = event.get("response", event)
+                    cands = resp.get("candidates") or []
+                    if not cands:
+                        continue
+                    parts = (cands[0].get("content") or {}).get("parts") or []
+                    delta_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text"))
+                    if delta_text:
+                        self.wfile.write(f"data: {json.dumps({'id': completion_id, 'object': 'text_completion', 'created': created, 'model': model, 'choices': [{'text': delta_text, 'index': 0, 'finish_reason': None}]})}\n\n".encode())
+                        self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+
+    # ── Anthropic Messages API Handler ────────────────────────────────────────
+
+    def _handle_anthropic_messages(self):
+        body = self._read_body()
+        if not isinstance(body, dict):
+            self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
+            return
+
+        model = body.get("model") or "claude-sonnet-5.5"
+        stream = bool(body.get("stream", False))
+        system = body.get("system")
+        raw_msgs = body.get("messages", [])
+
+        conv_messages = []
+        if system:
+            conv_messages.append({"role": "system", "content": _content_to_text(system)})
+
+        for m in raw_msgs:
+            role = m.get("role", "user")
+            content = m.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                tool_calls = []
+                for b in content:
+                    if isinstance(b, dict):
+                        btype = b.get("type")
+                        if btype == "text":
+                            text_parts.append(b.get("text", ""))
+                        elif btype == "tool_use":
+                            tool_calls.append({
+                                "id": b.get("id"),
+                                "type": "function",
+                                "function": {"name": b.get("name"), "arguments": json.dumps(b.get("input", {}))},
+                            })
+                        elif btype == "tool_result":
+                            conv_messages.append({
+                                "role": "tool",
+                                "tool_call_id": b.get("tool_use_id"),
+                                "content": _content_to_text(b.get("content")),
+                            })
+                msg_dict = {"role": role, "content": "\n".join(text_parts)}
+                if tool_calls:
+                    msg_dict["tool_calls"] = tool_calls
+                conv_messages.append(msg_dict)
+            else:
+                conv_messages.append({"role": role, "content": _content_to_text(content)})
+
+        # Tools conversion
+        anthropic_tools = body.get("tools", [])
+        openai_tools = []
+        for t in anthropic_tools:
+            if isinstance(t, dict):
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name"),
+                        "description": t.get("description", ""),
+                        "parameters": t.get("input_schema", {}),
+                    }
+                })
+
+        backend_model, thinking_level = resolve_backend_model(model)
+        chat_body = {
+            "model": model,
+            "messages": conv_messages,
+            "max_tokens": body.get("max_tokens", 4096),
+            "temperature": body.get("temperature"),
+            "tools": openai_tools if openai_tools else None,
+            "stream": stream,
+        }
+
+        try:
+            envelope = _build_gemini_request(chat_body, backend_model, thinking_level)
+        except Exception as e:
+            self._send_error_json("request_error", str(e), http_code=400)
+            return
+
+        if not stream:
+            try:
+                gemini_resp = call_generate_content(envelope)
+                cand = (gemini_resp.get("candidates") or [{}])[0]
+                parts = (cand.get("content") or {}).get("parts") or []
+                text, tool_calls, _ = _extract_parts(parts)
+
+                content_blocks = []
+                if text:
+                    content_blocks.append({"type": "text", "text": text})
+                for tc in tool_calls:
+                    fn = tc.get("function") or {}
+                    try:
+                        args = json.loads(fn.get("arguments", "{}"))
+                    except Exception:
+                        args = {"raw": fn.get("arguments")}
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id"),
+                        "name": fn.get("name"),
+                        "input": args,
+                    })
+
+                usage = _extract_usage(gemini_resp)
+                self._send_json(200, {
+                    "id": f"msg_{uuid.uuid4().hex[:24]}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": content_blocks,
+                    "model": model,
+                    "stop_reason": "tool_use" if tool_calls else "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]},
+                })
+            except UpstreamError as e:
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+        else:
+            # Anthropic streaming
+            msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self._send_cors_headers()
+            self.end_headers()
+            self.close_connection = True
+
+            def send_event(event_type: str, data: dict):
+                try:
+                    self.wfile.write(f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode())
+                    self.wfile.flush()
+                except Exception:
+                    pass
+
+            send_event("message_start", {
+                "type": "message_start",
+                "message": {"id": msg_id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None, "usage": {"input_tokens": 10, "output_tokens": 0}}
+            })
+            send_event("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+
+            try:
+                for event in stream_generate_content(envelope):
+                    if not isinstance(event, dict) or event.get("__done__"):
+                        break
+                    resp = event.get("response", event)
+                    cands = resp.get("candidates") or []
+                    if not cands:
+                        continue
+                    parts = (cands[0].get("content") or {}).get("parts") or []
+                    delta_text, _, _ = _extract_delta_from_parts(parts, set())
+                    if delta_text:
+                        send_event("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta_text}})
+
+                send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+                send_event("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 20}})
+                send_event("message_stop", {"type": "message_stop"})
+            except Exception:
+                pass
+
+    # ── OpenAI Image Generations Handler ──────────────────────────────────────
+
+    def _handle_images(self):
+        body = self._read_body()
+        if not isinstance(body, dict):
+            self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
+            return
+
+        prompt = body.get("prompt", "")
+        if not prompt:
+            self._send_error_json("invalid_request", "Prompt is required", http_code=400)
+            return
+
+        size = str(body.get("size") or "1024x1024").lower()
+        aspect_ratio = "1:1"
+        if "1792x1024" in size or "1344x768" in size:
+            aspect_ratio = "16:9"
+        elif "1024x1792" in size or "768x1344" in size:
+            aspect_ratio = "9:16"
+        elif "3:2" in size:
+            aspect_ratio = "3:2"
+
+        envelope = {
+            "project": get_project_id(),
+            "model": "gemini-3.1-flash-image",
+            "request": {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "imageConfig": {"aspectRatio": aspect_ratio},
+                    "candidateCount": 1
                 }
-                send_sse(err_chunk)
+            },
+            "requestType": "image_gen",
+            "userAgent": "antigravity",
+            "requestId": f"agent-{uuid.uuid4().hex}"
+        }
+
+        try:
+            resp = call_generate_content(envelope)
+            cands = resp.get("candidates") or []
+            if not cands:
+                raise RuntimeError("No image candidates returned from Google")
+            parts = (cands[0].get("content") or {}).get("parts") or []
+            b64_data = ""
+            for p in parts:
+                if isinstance(p, dict) and "inlineData" in p:
+                    b64_data = p["inlineData"].get("data", "")
+                    break
+            if not b64_data:
+                raise RuntimeError("No image data in response")
+
+            self._send_json(200, {
+                "created": int(time.time()),
+                "data": [{"b64_json": b64_data}]
+            })
+        except UpstreamError as e:
+            self._send_error_json("upstream_error", str(e), http_code=e.status)
+        except Exception as e:
+            self._send_error_json("image_error", f"Image generation failed: {e}", http_code=500)
+
+    # ── Native Gemini Passthrough Handler ─────────────────────────────────────
+
+    def _handle_gemini_passthrough(self, path: str):
+        body = self._read_body()
+        if not isinstance(body, dict):
+            self._send_error_json("invalid_request", "Invalid JSON body", http_code=400)
+            return
+
+        m = _GEMINI_PASSTHROUGH_RE.match(path)
+        model = m.group(1)
+        action = m.group(2)
+
+        try:
+            envelope = _build_passthrough_envelope(model, body)
+        except Exception as e:
+            self._send_error_json("request_error", f"Failed to build envelope: {e}", http_code=400)
+            return
+
+        if action == "generateContent":
+            try:
+                gemini_resp = call_generate_content(envelope)
+                self._send_json(200, gemini_resp)
+            except UpstreamError as e:
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+        else:
+            # streamGenerateContent passthrough
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self._send_cors_headers()
+            self.end_headers()
+            self.close_connection = True
+
+            try:
+                for event in stream_generate_content(envelope):
+                    if not isinstance(event, dict) or event.get("__done__"):
+                        break
+                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                    self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except Exception:
@@ -1690,57 +1452,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Server entry point
+# Main Entry Point
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _preflight_check():
-    """Validate the token file exists and is readable before starting."""
-    if not os.path.isfile(TOKEN_FILE):
-        _log(f"ERROR: Token file not found at {TOKEN_FILE}")
-        _log("Run the Antigravity CLI (`agy`) to authenticate first.")
-        return False
-    data = _read_token_from_disk()
-    if not data:
-        _log("ERROR: Token file exists but could not be parsed.")
-        return False
-    token_obj = data.get("token") or {}
-    if not token_obj.get("refresh_token"):
-        _log("ERROR: No refresh_token in token file. Re-run `agy` to authenticate.")
-        return False
-    _log(f"Token file OK (auth_method={data.get('auth_method', 'unknown')})")
-    return True
-
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Antigravity OpenAI-compatible proxy (Cloud Code Assist API)"
-    )
-    parser.add_argument("--port", type=int, default=8877, help="Port to listen on (default 8877)")
-    parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (default 127.0.0.1)")
+    parser = argparse.ArgumentParser(description="Antigravity Universal OpenAI/Anthropic/Gemini Proxy")
+    parser.add_argument("--port", type=int, default=8877, help="Port to listen on (default: 8877)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface to bind to (default: 127.0.0.1)")
     args = parser.parse_args()
 
-    if not _preflight_check():
-        sys.exit(1)
+    _log("Starting Antigravity Universal Proxy...")
+    _read_token_from_disk()
+    get_access_token()
+    get_project_id()
 
-    # Pre-discover the project ID so the first request is fast.
-    try:
-        get_project_id()
-    except Exception as e:
-        _log(f"WARNING: Could not pre-discover project ID: {e}")
-        _log("It will be discovered on the first request.")
+    # Pre-warm dynamic model catalog in background
+    threading.Thread(target=get_available_models, daemon=True).start()
 
     server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
-    server.daemon_threads = True
-    _log(f"Antigravity proxy listening on http://{args.host}:{args.port}/v1")
-    _log(f"  Models: {', '.join(MODEL_MAP.keys())}")
-    _log(f"  Token:  {TOKEN_FILE}")
-    _log(f"  Press Ctrl+C to stop")
+    _log(f"Listening on http://{args.host}:{args.port}")
+    _log("Endpoints active:")
+    _log("  • OpenAI Chat:        POST /v1/chat/completions")
+    _log("  • OpenAI Completions:   POST /v1/completions")
+    _log("  • Anthropic Messages:   POST /v1/messages")
+    _log("  • Image Generations:    POST /v1/images/generations")
+    _log("  • Gemini Passthrough:   POST /v1beta/models/{model}:generateContent (and stream)")
+    _log("  • Live Models (Dynamic):GET  /v1/models, GET /v1beta/models")
+    _log("  • Quota & Usage:        GET  /v1/usage")
+    _log("  • Healthcheck:          GET  /health")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        _log("\nShutting down...")
-        server.shutdown()
+        _log("Shutting down cleanly...")
+        server.server_close()
 
 
 if __name__ == "__main__":

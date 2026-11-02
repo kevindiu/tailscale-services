@@ -203,6 +203,23 @@ To switch models in Hermes:
 docker compose exec -it hermes hermes config set model.default claude-sonnet-5.5
 ```
 
+#### Supported Endpoints in Antigravity Bridge
+The bridge dynamically discovers all 31+ models available to your Google account with **zero hardcoding** and exposes full multi-protocol support:
+
+| Protocol | Endpoint | Description |
+| :--- | :--- | :--- |
+| **OpenAI Chat** | `POST /v1/chat/completions` | Streaming & non-streaming chat with function/tool calling |
+| **OpenAI Text** | `POST /v1/completions` | Legacy completions (code completion / FIM) |
+| **Anthropic** | `POST /v1/messages` | Full Claude Messages API (Claude Code, Continue.dev, Zed) |
+| **OpenAI Images**| `POST /v1/images/generations`| Image generation via `gemini-3.1-flash-image` |
+| **Gemini Native**| `POST /v1beta/models/{model}:generateContent` | Direct Gemini JSON & image passthrough |
+| **Gemini Stream**| `POST /v1beta/models/{model}:streamGenerateContent` | Direct Gemini streaming passthrough |
+| **Models List** | `GET /v1/models` & `GET /v1beta/models` | Dynamic live model discovery from Google |
+| **Model Info** | `GET /v1/models/{model}` | Model metadata and backend mapping |
+| **Quota & Usage**| `GET /v1/usage` | Real-time weekly and 5-hour limit remaining |
+| **Health** | `GET /health` | Bridge status and connected Google Cloud project |
+| **CORS** | `OPTIONS /*` | Full CORS preflight support for web frontends |
+
 ---
 
 ### Step 8: Approve Exit Node in Tailscale Admin
