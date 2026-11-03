@@ -78,8 +78,10 @@ tailscale-services/
 ├── .env                            # Active environment file (ignored by git)
 ├── AdGuardHome.template.yaml       # Pre-configured upstream resolvers, DNSSEC & blocklists
 ├── antigravity_proxy.py            # Containerized OpenAI-to-CloudCode SSE bridge script
-├── AGENTS.md                       # This file (AI developer instructions)
+├── AGENTS.md                       # This file (AI developer instructions & invariants)
 ├── README.md                       # Human documentation
+├── scripts/
+│   └── init-volumes.sh             # Sets up ./data directories with strict 700/755 permissions
 └── data/                           # Persistent state directory (ignored by git)
     ├── adguard/                    # AdGuard configuration and query logs
     │   ├── conf/AdGuardHome.yaml
@@ -164,6 +166,12 @@ docker compose exec -it hermes hermes config set model.default claude-sonnet-5.5
 
 ## 6. Guidelines for AI Assistants
 
-- **Editing `docker-compose.yml`:** Always keep `name: tailscale-services` at the root. Ensure memory limits, restart policies, and Watchtower labels (`com.centurylinklabs.watchtower.depends-on=tailscale`) are preserved when adding services.
+- **Editing `docker-compose.yml`:**
+  - Always keep `name: tailscale-services` at the root.
+  - Every service must attach the `x-logging: &default-logging` anchor (`<<: *default-logging`) to prevent unbounded disk usage.
+  - Sub-services must keep `depends_on: tailscale: { condition: service_healthy }` and maintain their individual container healthchecks.
+  - Ensure memory limits, restart policies, and Watchtower labels (`com.centurylinklabs.watchtower.depends-on=tailscale`) are preserved when adding services.
+  - Never add host-bound `ports:` mappings. All services must be routed strictly through `network_mode: "service:tailscale"`.
+- **Tailscale DNS Isolation:** Always keep `TS_ACCEPT_DNS=false` on the `tailscale` container to prevent DNS loop deadlocks with AdGuard Home.
 - **Modifying Antigravity Models:** When adding new models, update both `MODEL_MAP` in `antigravity_proxy.py` and `fallback_models` in `data/hermes/plugins/model-providers/antigravity/__init__.py`.
-- **Handling Secrets:** Never commit `.env` or files under `data/` to git.
+- **Handling Secrets:** Never commit `.env` or files under `data/` to git. Never insert real API keys or OAuth secrets into `env.example` or compose fallbacks.
