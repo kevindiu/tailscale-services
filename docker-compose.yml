@@ -1,7 +1,15 @@
 name: tailscale-services
 
+x-logging: &default-logging
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   tailscale:
+    <<: *default-logging
     image: tailscale/tailscale:latest
     container_name: tailscale
     hostname: ${TAILSCALE_HOSTNAME:-tailscale-services}
@@ -10,6 +18,8 @@ services:
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
       - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---advertise-exit-node}
+      # Prevent DNS deadlock/loops: daemon always resolves coordination server via host DNS
+      - TS_ACCEPT_DNS=false
       # Clamp MSS to PMTU prevents packet blackholes on Exit Node forwarding (PPPoE / MTU mismatch)
       - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
     sysctls:
@@ -48,6 +58,7 @@ services:
     #   - "21116:21116/udp"
 
   adguardhome:
+    <<: *default-logging
     image: adguard/adguardhome:latest
     container_name: adguardhome
     restart: unless-stopped
@@ -75,6 +86,7 @@ services:
 
   # RustDesk ID / Rendezvous Server
   rustdesk-hbbs:
+    <<: *default-logging
     image: rustdesk/rustdesk-server:latest
     container_name: rustdesk-hbbs
     restart: unless-stopped
@@ -87,6 +99,12 @@ services:
       resources:
         limits:
           memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep hbbs || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     labels:
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
@@ -95,6 +113,7 @@ services:
 
   # RustDesk Relay Server
   rustdesk-hbbr:
+    <<: *default-logging
     image: rustdesk/rustdesk-server:latest
     container_name: rustdesk-hbbr
     restart: unless-stopped
@@ -106,6 +125,12 @@ services:
       resources:
         limits:
           memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep hbbr || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     labels:
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
@@ -115,6 +140,7 @@ services:
   # Antigravity OpenAI Bridge
   # Runs entirely inside Docker — zero processes on your Mac, zero connection to host Mac
   antigravity-proxy:
+    <<: *default-logging
     image: python:3.11-alpine
     container_name: antigravity-proxy
     restart: unless-stopped
@@ -124,8 +150,8 @@ services:
       - ./antigravity_proxy.py:/app/antigravity_proxy.py:ro
     command: python3 /app/antigravity_proxy.py --host 127.0.0.1 --port 8877
     environment:
-      - ANTIGRAVITY_CLIENT_ID=${ANTIGRAVITY_CLIENT_ID:-1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com}
-      - ANTIGRAVITY_CLIENT_SECRET=${ANTIGRAVITY_CLIENT_SECRET:-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}
+      - ANTIGRAVITY_CLIENT_ID=${ANTIGRAVITY_CLIENT_ID}
+      - ANTIGRAVITY_CLIENT_SECRET=${ANTIGRAVITY_CLIENT_SECRET}
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -134,6 +160,12 @@ services:
       resources:
         limits:
           memory: 128M
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8877/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     labels:
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
@@ -142,6 +174,7 @@ services:
 
   # Hermes AI Agent (Autonomous Agent & Gateway)
   hermes:
+    <<: *default-logging
     image: nousresearch/hermes-agent:latest
     container_name: hermes
     restart: unless-stopped
@@ -176,6 +209,12 @@ services:
       resources:
         limits:
           memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9119/', timeout=3)\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
     labels:
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
@@ -184,6 +223,7 @@ services:
 
   # Automatic image updater: checks Docker Hub for updates and updates only if a new image exists
   watchtower:
+    <<: *default-logging
     image: containrrr/watchtower:latest
     container_name: watchtower
     restart: unless-stopped
