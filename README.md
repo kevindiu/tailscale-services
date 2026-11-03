@@ -80,11 +80,12 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
    TS_EXTRA_ARGS=--advertise-exit-node
    RUSTDESK_RELAY_HOST=tailscale-services
    ```
-3. Start the containers:
+3. Start the containers (initialize data directories first):
    ```bash
+   ./scripts/init-volumes.sh
    docker compose up -d
    ```
-4. Verify all services are running:
+4. Verify all services are running and healthy:
    ```bash
    docker compose ps
    docker compose logs -f
