@@ -169,7 +169,7 @@ docker compose exec -it hermes hermes config set model.default claude-sonnet-5.5
 - **Editing `docker-compose.yml`:**
   - Always keep `name: tailscale-services` at the root.
   - Every service must attach the `x-logging: &default-logging` anchor (`<<: *default-logging`) to prevent unbounded disk usage.
-  - Sub-services must keep `depends_on: tailscale: { condition: service_healthy }` and maintain their individual container healthchecks.
+  - Sub-services must keep `depends_on: tailscale: { condition: service_healthy }`. Do not add shell-based healthchecks to `rustdesk` as its minimalist container image lacks utilities like `pgrep` or `curl`.
   - Ensure memory limits, restart policies, and Watchtower labels (`com.centurylinklabs.watchtower.depends-on=tailscale`) are preserved when adding services.
   - Never add host-bound `ports:` mappings. All services must be routed strictly through `network_mode: "service:tailscale"`.
 - **Tailscale DNS Isolation:** Always keep `TS_ACCEPT_DNS=false` on the `tailscale` container to prevent DNS loop deadlocks with AdGuard Home.
