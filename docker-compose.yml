@@ -10,6 +10,11 @@ services:
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
       - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---advertise-exit-node}
+      # Clamp MSS to PMTU prevents packet blackholes on Exit Node forwarding (PPPoE / MTU mismatch)
+      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
     volumes:
       - ./data/tailscale:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun
@@ -25,6 +30,13 @@ services:
         limits:
           memory: 256M
     restart: unless-stopped
+    # Health check ensuring Tailscale local daemon responds
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     # SECURITY NOTE: Do NOT expose ports to the host interface on a public VPS.
     # Leaving ports unmapped guarantees traffic is reachable ONLY via your private Tailscale network.
     # ports:
@@ -52,7 +64,14 @@ services:
       # Ensures Watchtower safely recreates AdGuard if Tailscale is updated
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
-      - tailscale
+      tailscale:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/adguardhome/AdGuardHome --version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   # RustDesk ID / Rendezvous Server
   rustdesk-hbbs:
@@ -71,7 +90,8 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
-      - tailscale
+      tailscale:
+        condition: service_healthy
 
   # RustDesk Relay Server
   rustdesk-hbbr:
@@ -89,7 +109,8 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
-      - tailscale
+      tailscale:
+        condition: service_healthy
 
   # Antigravity OpenAI Bridge
   # Runs entirely inside Docker — zero processes on your Mac, zero connection to host Mac
@@ -116,7 +137,8 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
-      - tailscale
+      tailscale:
+        condition: service_healthy
 
   # Hermes AI Agent (Autonomous Agent & Gateway)
   hermes:
@@ -157,7 +179,8 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
-      - tailscale
+      tailscale:
+        condition: service_healthy
 
   # Automatic image updater: checks Docker Hub for updates and updates only if a new image exists
   watchtower:
