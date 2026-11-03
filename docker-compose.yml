@@ -10,6 +10,8 @@ services:
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
       - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---advertise-exit-node}
+      # Prevent DNS deadlock/loops: daemon always resolves coordination server via host DNS
+      - TS_ACCEPT_DNS=false
       # Clamp MSS to PMTU prevents packet blackholes on Exit Node forwarding (PPPoE / MTU mismatch)
       - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
     sysctls:
@@ -124,8 +126,8 @@ services:
       - ./antigravity_proxy.py:/app/antigravity_proxy.py:ro
     command: python3 /app/antigravity_proxy.py --host 127.0.0.1 --port 8877
     environment:
-      - ANTIGRAVITY_CLIENT_ID=${ANTIGRAVITY_CLIENT_ID:-1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com}
-      - ANTIGRAVITY_CLIENT_SECRET=${ANTIGRAVITY_CLIENT_SECRET:-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}
+      - ANTIGRAVITY_CLIENT_ID=${ANTIGRAVITY_CLIENT_ID}
+      - ANTIGRAVITY_CLIENT_SECRET=${ANTIGRAVITY_CLIENT_SECRET}
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -134,6 +136,12 @@ services:
       resources:
         limits:
           memory: 128M
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8877/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     labels:
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
@@ -176,6 +184,12 @@ services:
       resources:
         limits:
           memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9119/', timeout=3)\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
     labels:
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
     depends_on:
