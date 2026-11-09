@@ -837,19 +837,54 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_cors_headers()
         self.end_headers()
 
-    def _send_json(self, code: int, data: dict):
+    def _send_json(self, code: int, data: dict, extra_headers: list[tuple[str, str]] | None = None):
         body = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self._send_cors_headers()
         self.send_header("Content-Length", str(len(body)))
+        if extra_headers:
+            for k, v in extra_headers:
+                self.send_header(k, v)
         self.end_headers()
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _send_error_json(self, code: str, message: str, err_type: str = "api_error", http_code: int = 400):
+    def _send_error_json(self, code: str, message: str, err_type: str = "api_error", http_code: int = 400, extra_headers: list[tuple[str, str]] | None = None):
+        headers = list(extra_headers) if extra_headers else []
+        if http_code == 429:
+            retry_seconds = None
+            # 1. Look for retryDelay
+            m = re.search(r"['\"]?retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s?['\"]?", message)
+            if m:
+                try:
+                    retry_seconds = max(1, int(float(m.group(1))))
+                except Exception:
+                    pass
+            # 2. Look for quotaResetTimeStamp
+            if retry_seconds is None:
+                m_ts = re.search(r"['\"]?quotaResetTimeStamp['\"]?\s*:\s*['\"]?([0-9T:\-Z\.]+)['\"]?", message)
+                if m_ts:
+                    try:
+                        ts_str = m_ts.group(1).rstrip("Z") + "+00:00"
+                        target_dt = datetime.fromisoformat(ts_str)
+                        retry_seconds = max(1, int((target_dt - datetime.now(timezone.utc)).total_seconds()))
+                    except Exception:
+                        pass
+            # 3. Look for Resets in 138h3m54s
+            if retry_seconds is None:
+                m_txt = re.search(r"resets?\s+in\s+(?:(\d+(?:\.\d+)?)\s*h)?\s*(?:(\d+(?:\.\d+)?)\s*m)?\s*(?:(\d+(?:\.\d+)?)\s*s)?", message, re.IGNORECASE)
+                if m_txt and any(m_txt.groups()):
+                    h = float(m_txt.group(1) or 0)
+                    m_val = float(m_txt.group(2) or 0)
+                    s = float(m_txt.group(3) or 0)
+                    retry_seconds = max(1, int(h * 3600 + m_val * 60 + s))
+
+            if retry_seconds is not None:
+                headers.append(("Retry-After", str(retry_seconds)))
+
         self._send_json(http_code, {
             "error": {
                 "message": message,
@@ -857,7 +892,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "param": None,
                 "code": code,
             }
-        })
+        }, extra_headers=headers)
 
     def _read_body(self) -> dict | None:
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -1018,6 +1053,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error_json("upstream_error", str(e), http_code=e.status)
 
     def _stream_chat(self, envelope: dict, openai_model: str):
+        # Peak first event or check for immediate upstream failure BEFORE sending HTTP 200
+        gen = stream_generate_content(envelope)
+        first_event = None
+        try:
+            first_event = next(gen)
+        except UpstreamError as e:
+            self._send_error_json("upstream_error", str(e), http_code=e.status)
+            return
+        except StopIteration:
+            pass
+        except Exception as e:
+            self._send_error_json("upstream_error", str(e), http_code=502)
+            return
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
@@ -1051,8 +1100,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finish_reason = "stop"
         total_usage = None
 
+        def iter_events():
+            if first_event is not None:
+                yield first_event
+            yield from gen
+
         try:
-            for event in stream_generate_content(envelope):
+            for event in iter_events():
                 if not isinstance(event, dict) or event.get("__done__"):
                     break
                 resp = event.get("response", event)
