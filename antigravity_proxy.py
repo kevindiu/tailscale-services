@@ -35,6 +35,7 @@ import base64
 import json
 import os
 import re
+import signal
 import sys
 import threading
 import time
@@ -53,7 +54,7 @@ from urllib.error import HTTPError, URLError
 CLIENT_ID = os.environ.get("ANTIGRAVITY_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("ANTIGRAVITY_CLIENT_SECRET", "")
 
-TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
+TOKEN_FILE = os.environ.get("ANTIGRAVITY_TOKEN_FILE") or os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 CLOUDCODE_BASE = "https://daily-cloudcode-pa.googleapis.com"
 LOAD_CODEASSIST_URL = f"{CLOUDCODE_BASE}/v1internal:loadCodeAssist"
@@ -74,6 +75,7 @@ DEFAULT_SYSTEM_INSTRUCTION = "You are a helpful AI assistant."
 DEFAULT_MODEL = "gemini-3.8-flash"
 UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh 2 mins before expiry
+MAX_PAYLOAD_SIZE = 20 * 1024 * 1024  # 20MB
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Token & Project State
@@ -130,10 +132,17 @@ def _read_token_from_disk() -> dict | None:
 
 
 def _write_token_to_disk(data: dict):
+    tmp = None
     try:
-        tmp = TOKEN_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
+        token_dir = os.path.dirname(TOKEN_FILE)
+        if token_dir:
+            os.makedirs(token_dir, exist_ok=True)
+        tmp = f"{TOKEN_FILE}.tmp.{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o600
+        fd = os.open(tmp, flags, mode)
+        with open(fd, "w") as f:
+            json.dump(data, f, indent=2)
         os.replace(tmp, TOKEN_FILE)
         try:
             os.chmod(TOKEN_FILE, 0o600)
@@ -141,6 +150,11 @@ def _write_token_to_disk(data: dict):
             pass
     except OSError as e:
         _log(f"WARNING: could not write token file: {e}")
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _refresh_access_token(refresh_token: str) -> dict:
@@ -177,6 +191,9 @@ def _refresh_access_token(refresh_token: str) -> dict:
 
 def get_access_token() -> str:
     global _cached_access_token
+    # Quick check outside lock
+    now = time.time()
+    # Lock for double-checked token validity
     with _token_lock:
         data = _read_token_from_disk()
         if not data:
@@ -186,15 +203,19 @@ def get_access_token() -> str:
         expiry_ts = _parse_expiry(token_obj.get("expiry"))
         now = time.time()
 
-        if not access_token or expiry_ts == 0.0 or (expiry_ts - now) < TOKEN_REFRESH_SKEW:
-            refresh_token = token_obj.get("refresh_token")
-            if not refresh_token:
-                raise RuntimeError("No refresh_token available; cannot refresh OAuth token.")
-            _log("Access token expired (or missing) — refreshing via Google OAuth...")
-            new_tok = _refresh_access_token(refresh_token)
-            data["token"] = new_tok
-            _write_token_to_disk(data)
-            access_token = new_tok["access_token"]
+        # If disk token is still valid (another thread/process may have refreshed it), use it
+        if access_token and expiry_ts > 0.0 and (expiry_ts - now) >= TOKEN_REFRESH_SKEW:
+            _cached_access_token = access_token
+            return access_token
+
+        refresh_token = token_obj.get("refresh_token")
+        if not refresh_token:
+            raise RuntimeError("No refresh_token available; cannot refresh OAuth token.")
+        _log("Access token expired (or missing) — refreshing via Google OAuth...")
+        new_tok = _refresh_access_token(refresh_token)
+        data["token"] = new_tok
+        _write_token_to_disk(data)
+        access_token = new_tok["access_token"]
 
         _cached_access_token = access_token
         return access_token
@@ -647,6 +668,11 @@ def _extract_parts(parts: list) -> tuple[str, list, str | None]:
     return "".join(text_chunks), tool_calls, finish_hint
 
 
+def _approx_token_count(text: str) -> int:
+    if not text:
+        return 0
+    # ~4 characters per token heuristic
+    return max(1, (len(text) + 3) // 4)
 def _extract_usage(response: dict) -> dict:
     usage = response.get("usageMetadata") or {}
     if not usage:
@@ -771,6 +797,42 @@ def call_generate_content(envelope: dict) -> dict:
         raise UpstreamError(f"Upstream network error: {e}", status=502)
 
 
+class StreamResponse:
+    def __init__(self, resp):
+        self._resp = resp
+        self._gen = self._generate()
+
+    def _generate(self):
+        try:
+            for line in self._resp:
+                line_str = line.decode("utf-8", errors="replace").strip() if isinstance(line, bytes) else str(line).strip()
+                if not line_str or line_str.startswith(":") or line_str.startswith("event:") or line_str.startswith("id:"):
+                    continue
+                if line_str.startswith("data:"):
+                    data_str = line_str[5:].strip()
+                    if data_str == "[DONE]":
+                        yield {"__done__": True}
+                        break
+                    try:
+                        yield json.loads(data_str)
+                    except json.JSONDecodeError:
+                        pass
+        finally:
+            self.close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._gen)
+
+    def close(self):
+        try:
+            self._resp.close()
+        except Exception:
+            pass
+
+
 def stream_generate_content(envelope: dict):
     req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, envelope, streaming=True)
     try:
@@ -785,22 +847,7 @@ def stream_generate_content(envelope: dict):
     except Exception as e:
         raise UpstreamError(f"Upstream stream network error: {e}", status=502)
 
-    try:
-        for line in resp:
-            line_str = line.decode("utf-8", errors="replace").strip() if isinstance(line, bytes) else str(line).strip()
-            if not line_str or line_str.startswith(":") or line_str.startswith("event:") or line_str.startswith("id:"):
-                continue
-            if line_str.startswith("data:"):
-                data_str = line_str[5:].strip()
-                if data_str == "[DONE]":
-                    yield {"__done__": True}
-                    break
-                try:
-                    yield json.loads(data_str)
-                except json.JSONDecodeError:
-                    pass
-    finally:
-        resp.close()
+    return StreamResponse(resp)
 
 
 def fetch_quota_summary() -> dict:
@@ -852,6 +899,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _is_anthropic_path(self) -> bool:
+        path = urlparse(self.path).path
+        return path in ("/v1/messages", "/messages")
+
     def _send_error_json(self, code: str, message: str, err_type: str = "api_error", http_code: int = 400, extra_headers: list[tuple[str, str]] | None = None):
         headers = list(extra_headers) if extra_headers else []
         if http_code == 429:
@@ -885,6 +936,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if retry_seconds is not None:
                 headers.append(("Retry-After", str(retry_seconds)))
 
+        # Anthropic format error for Anthropic endpoints
+        if self._is_anthropic_path():
+            anthropic_type = "invalid_request_error"
+            if http_code == 401:
+                anthropic_type = "authentication_error"
+            elif http_code == 403:
+                anthropic_type = "permission_error"
+            elif http_code == 404:
+                anthropic_type = "not_found_error"
+            elif http_code == 413:
+                anthropic_type = "request_too_large"
+            elif http_code == 429:
+                anthropic_type = "rate_limit_error"
+            elif http_code >= 500:
+                anthropic_type = "api_error"
+
+            self._send_json(http_code, {
+                "type": "error",
+                "error": {
+                    "type": anthropic_type,
+                    "message": message,
+                }
+            }, extra_headers=headers)
+            return
+
         self._send_json(http_code, {
             "error": {
                 "message": message,
@@ -895,7 +971,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         }, extra_headers=headers)
 
     def _read_body(self) -> dict | None:
-        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (ValueError, TypeError):
+            length = 0
+        if length > MAX_PAYLOAD_SIZE:
+            self._send_error_json("payload_too_large", f"Payload size {length} exceeds {MAX_PAYLOAD_SIZE} limit", err_type="invalid_request_error", http_code=413)
+            return None
         if length <= 0:
             return {}
         raw = self.rfile.read(length)
@@ -1026,6 +1108,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_chat(self):
         body = self._read_body()
+        if body is None:
+            return
         if not isinstance(body, dict):
             self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
             return
@@ -1041,7 +1125,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         if stream:
-            self._stream_chat(envelope, openai_model)
+            stream_options = body.get("stream_options") or {}
+            include_usage = bool(stream_options.get("include_usage", False))
+            self._stream_chat(envelope, openai_model, include_usage=include_usage)
         else:
             self._nonstream_chat(envelope, openai_model)
 
@@ -1052,7 +1138,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except UpstreamError as e:
             self._send_error_json("upstream_error", str(e), http_code=e.status)
 
-    def _stream_chat(self, envelope: dict, openai_model: str):
+    def _stream_chat(self, envelope: dict, openai_model: str, include_usage: bool = False):
         # Peak first event or check for immediate upstream failure BEFORE sending HTTP 200
         gen = stream_generate_content(envelope)
         first_event = None
@@ -1073,32 +1159,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
+        self.send_header("Connection", "keep-alive")
         self.send_header("X-Accel-Buffering", "no")
         self._send_cors_headers()
         self.end_headers()
-        self.close_connection = True
 
         def send_sse(obj: dict) -> bool:
             try:
                 self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())
                 self.wfile.flush()
                 return True
+            except (BrokenPipeError, ConnectionResetError):
+                return False
             except Exception:
                 return False
 
         # First role chunk
-        send_sse({
+        if not send_sse({
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": openai_model,
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
-        })
+        }):
+            gen.close()
+            return
 
-        seen_tool_names = set()
+        seen_tool_indexes = set()
         finish_reason = "stop"
-        total_usage = None
+        total_usage: dict | None = None
+        has_tool_calls = False
 
         def iter_events():
             if first_event is not None:
@@ -1110,19 +1200,62 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if not isinstance(event, dict) or event.get("__done__"):
                     break
                 resp = event.get("response", event)
-                if resp.get("usageMetadata"):
-                    total_usage = resp["usageMetadata"]
+                if isinstance(resp, dict):
+                    meta = resp.get("usageMetadata")
+                    if isinstance(meta, dict):
+                        total_usage = meta
 
                 cands = resp.get("candidates") or []
                 if not cands:
                     continue
                 cand = cands[0]
                 parts = (cand.get("content") or {}).get("parts") or []
-                text_delta, tool_deltas, seen_tool_names = _extract_delta_from_parts(parts, seen_tool_names)
+
+                text_chunks = []
+                tool_deltas = []
+                for part in parts or []:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("text"):
+                        text_chunks.append(part["text"])
+                    if "functionCall" in part:
+                        has_tool_calls = True
+                        fc = part["functionCall"] or {}
+                        name = fc.get("name", "")
+                        args = fc.get("args", {})
+                        fc_id = fc.get("id", "")
+                        thought_sig = part.get("thoughtSignature") or part.get("thought_signature") or ""
+                        args_str = json.dumps(args) if isinstance(args, (dict, list)) else str(args)
+
+                        idx = len(seen_tool_indexes)
+                        encoded_id = f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else f"call_{uuid.uuid4().hex[:20]}"
+
+                        if idx not in seen_tool_indexes:
+                            seen_tool_indexes.add(idx)
+                            # First chunk for this tool call sends id, type, name, and initial arguments
+                            tool_deltas.append({
+                                "index": idx,
+                                "id": encoded_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": args_str,
+                                },
+                            })
+                        else:
+                            # Subsequent chunks stream index and delta arguments
+                            tool_deltas.append({
+                                "index": idx,
+                                "function": {
+                                    "arguments": args_str,
+                                },
+                            })
+
+                text_delta = "".join(text_chunks)
 
                 if cand.get("finishReason"):
                     fr_up = str(cand["finishReason"]).upper()
-                    finish_reason = "tool_calls" if tool_deltas else ("length" if fr_up == "MAX_TOKENS" else "stop")
+                    finish_reason = "tool_calls" if has_tool_calls else ("length" if fr_up == "MAX_TOKENS" else "stop")
 
                 delta = {}
                 if text_delta:
@@ -1131,13 +1264,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     delta["tool_calls"] = tool_deltas
 
                 if delta:
-                    send_sse({
+                    ok = send_sse({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": openai_model,
                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                     })
+                    if not ok:
+                        gen.close()
+                        return
 
             # Final stop chunk
             final_chunk = {
@@ -1147,20 +1283,38 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "model": openai_model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             }
-            if total_usage:
-                final_chunk["usage"] = {
-                    "prompt_tokens": total_usage.get("promptTokenCount", 0),
-                    "completion_tokens": total_usage.get("candidatesTokenCount", 0),
-                    "total_tokens": total_usage.get("totalTokenCount", 0),
+            if not send_sse(final_chunk):
+                gen.close()
+                return
+
+            # If stream_options.include_usage was requested, send standard usage-only chunk
+            if include_usage and total_usage:
+                usage_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": openai_model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": total_usage.get("promptTokenCount", 0),
+                        "completion_tokens": total_usage.get("candidatesTokenCount", 0),
+                        "total_tokens": total_usage.get("totalTokenCount", 0),
+                    },
                 }
-            send_sse(final_chunk)
+                if not send_sse(usage_chunk):
+                    gen.close()
+                    return
+
             try:
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
-            except Exception:
+            except (BrokenPipeError, ConnectionResetError):
                 pass
+        except (BrokenPipeError, ConnectionResetError):
+            gen.close()
         except Exception as e:
             _log(f"Stream error: {e}")
+            gen.close()
             try:
                 self.wfile.write(f"data: {json.dumps({'error': {'message': str(e)}})}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -1172,6 +1326,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_completions(self):
         body = self._read_body()
+        if body is None:
+            return
         if not isinstance(body, dict):
             self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
             return
@@ -1220,13 +1376,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
             self._send_cors_headers()
             self.end_headers()
-            self.close_connection = True
 
+            stream_resp = None
             try:
-                for event in stream_generate_content(envelope):
+                stream_resp = stream_generate_content(envelope)
+                for event in stream_resp:
                     if not isinstance(event, dict) or event.get("__done__"):
                         break
                     resp = event.get("response", event)
@@ -1236,17 +1394,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     parts = (cands[0].get("content") or {}).get("parts") or []
                     delta_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text"))
                     if delta_text:
-                        self.wfile.write(f"data: {json.dumps({'id': completion_id, 'object': 'text_completion', 'created': created, 'model': model, 'choices': [{'text': delta_text, 'index': 0, 'finish_reason': None}]})}\n\n".encode())
-                        self.wfile.flush()
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                        chunk_payload = f"data: {json.dumps({'id': completion_id, 'object': 'text_completion', 'created': created, 'model': model, 'choices': [{'text': delta_text, 'index': 0, 'finish_reason': None}]})}\n\n".encode()
+                        try:
+                            self.wfile.write(chunk_payload)
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            if stream_resp:
+                                stream_resp.close()
+                            break
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            except (BrokenPipeError, ConnectionResetError):
+                if stream_resp:
+                    stream_resp.close()
             except Exception:
-                pass
+                if stream_resp:
+                    stream_resp.close()
 
     # ── Anthropic Messages API Handler ────────────────────────────────────────
 
     def _handle_anthropic_messages(self):
         body = self._read_body()
+        if body is None:
+            return
         if not isinstance(body, dict):
             self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
             return
@@ -1362,47 +1535,198 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
             self._send_cors_headers()
             self.end_headers()
-            self.close_connection = True
 
-            def send_event(event_type: str, data: dict):
+            def send_event(event_type: str, data: dict) -> bool:
                 try:
                     self.wfile.write(f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode())
                     self.wfile.flush()
+                    return True
+                except (BrokenPipeError, ConnectionResetError):
+                    return False
                 except Exception:
-                    pass
+                    return False
 
-            send_event("message_start", {
-                "type": "message_start",
-                "message": {"id": msg_id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None, "usage": {"input_tokens": 10, "output_tokens": 0}}
-            })
-            send_event("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
-
+            stream_resp = None
             try:
-                for event in stream_generate_content(envelope):
+                stream_resp = stream_generate_content(envelope)
+
+                # Pre-calculate approximate prompt tokens
+                approx_prompt_tokens = 0
+                for m in conv_messages:
+                    approx_prompt_tokens += _approx_token_count(m.get("content") or "")
+                if anthropic_tools:
+                    approx_prompt_tokens += _approx_token_count(json.dumps(anthropic_tools))
+
+                total_usage: dict | None = None
+                output_tokens_count = 0
+
+                if not send_event("message_start", {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": max(1, approx_prompt_tokens), "output_tokens": 0},
+                    }
+                }):
+                    if stream_resp:
+                        stream_resp.close()
+                    return
+
+                text_block_index: int | None = None
+                tool_use_count = 0
+                has_tool_use = False
+
+                for event in stream_resp:
                     if not isinstance(event, dict) or event.get("__done__"):
                         break
                     resp = event.get("response", event)
+                    if isinstance(resp, dict):
+                        meta = resp.get("usageMetadata")
+                        if isinstance(meta, dict):
+                            total_usage = meta
+
                     cands = resp.get("candidates") or []
                     if not cands:
                         continue
                     parts = (cands[0].get("content") or {}).get("parts") or []
-                    delta_text, _, _ = _extract_delta_from_parts(parts, set())
-                    if delta_text:
-                        send_event("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta_text}})
 
-                send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
-                send_event("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 20}})
+                    for part in parts:
+                        if not isinstance(part, dict):
+                            continue
+                        part_text = part.get("text")
+                        if part_text:
+                            output_tokens_count += _approx_token_count(part_text)
+                            if text_block_index is None:
+                                text_block_index = tool_use_count
+                                if not send_event("content_block_start", {
+                                    "type": "content_block_start",
+                                    "index": text_block_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                }):
+                                    if stream_resp:
+                                        stream_resp.close()
+                                    return
+                            if not send_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": text_block_index,
+                                "delta": {"type": "text_delta", "text": part_text},
+                            }):
+                                if stream_resp:
+                                    stream_resp.close()
+                                return
+
+                        if "functionCall" in part:
+                            has_tool_use = True
+                            fc = part["functionCall"] or {}
+                            name = fc.get("name", "")
+                            args = fc.get("args", {})
+                            fc_id = fc.get("id") or f"toolu_{uuid.uuid4().hex[:20]}"
+                            thought_sig = part.get("thoughtSignature") or part.get("thought_signature") or ""
+                            encoded_id = f"{fc_id}|{thought_sig}" if thought_sig else fc_id
+
+                            # Close open text block if any before starting tool_use block
+                            if text_block_index is not None:
+                                if not send_event("content_block_stop", {
+                                    "type": "content_block_stop",
+                                    "index": text_block_index,
+                                }):
+                                    if stream_resp:
+                                        stream_resp.close()
+                                    return
+                                text_block_index = None
+
+                            current_tool_index = tool_use_count
+                            tool_use_count += 1
+
+                            # Emit content_block_start for tool_use
+                            if not send_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": current_tool_index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": encoded_id,
+                                    "name": name,
+                                    "input": {},
+                                },
+                            }):
+                                if stream_resp:
+                                    stream_resp.close()
+                                return
+
+                            # Emit content_block_delta with partial_json
+                            args_json = json.dumps(args) if isinstance(args, (dict, list)) else str(args)
+                            output_tokens_count += _approx_token_count(args_json)
+                            if not send_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": current_tool_index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": args_json,
+                                },
+                            }):
+                                if stream_resp:
+                                    stream_resp.close()
+                                return
+
+                            # Emit content_block_stop
+                            if not send_event("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": current_tool_index,
+                            }):
+                                if stream_resp:
+                                    stream_resp.close()
+                                return
+
+                # Close text block if still open
+                if text_block_index is not None:
+                    if not send_event("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": text_block_index,
+                    }):
+                        if stream_resp:
+                            stream_resp.close()
+                        return
+
+                final_output_tokens = (
+                    total_usage.get("candidatesTokenCount", output_tokens_count)
+                    if isinstance(total_usage, dict)
+                    else max(1, output_tokens_count)
+                )
+                stop_reason = "tool_use" if has_tool_use else "end_turn"
+
+                if not send_event("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": {"output_tokens": final_output_tokens},
+                }):
+                    if stream_resp:
+                        stream_resp.close()
+                    return
+
                 send_event("message_stop", {"type": "message_stop"})
-            except Exception:
-                pass
+            except (BrokenPipeError, ConnectionResetError):
+                if stream_resp:
+                    stream_resp.close()
+            except Exception as e:
+                _log(f"Anthropic stream error: {e}")
+                if stream_resp:
+                    stream_resp.close()
 
     # ── OpenAI Image Generations Handler ──────────────────────────────────────
 
     def _handle_images(self):
         body = self._read_body()
+        if body is None:
+            return
         if not isinstance(body, dict):
             self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
             return
@@ -1463,6 +1787,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_gemini_passthrough(self, path: str):
         body = self._read_body()
+        if body is None:
+            return
         if not isinstance(body, dict):
             self._send_error_json("invalid_request", "Invalid JSON body", http_code=400)
             return
@@ -1488,21 +1814,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
             self._send_cors_headers()
             self.end_headers()
-            self.close_connection = True
 
+            stream_resp = None
             try:
-                for event in stream_generate_content(envelope):
+                stream_resp = stream_generate_content(envelope)
+                for event in stream_resp:
                     if not isinstance(event, dict) or event.get("__done__"):
                         break
-                    self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                    try:
+                        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        if stream_resp:
+                            stream_resp.close()
+                        break
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            except (BrokenPipeError, ConnectionResetError):
+                if stream_resp:
+                    stream_resp.close()
             except Exception:
-                pass
+                if stream_resp:
+                    stream_resp.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1535,10 +1875,17 @@ def main():
     _log("  • Quota & Usage:        GET  /v1/usage")
     _log("  • Healthcheck:          GET  /health")
 
+    def _shutdown(signum, frame):
+        _log(f"Received signal {signum}, shutting down cleanly...")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
-        _log("Shutting down cleanly...")
+    finally:
+        _log("Server stopped, closing...")
         server.server_close()
 
 

@@ -132,12 +132,15 @@ services:
     image: python:3.11-alpine
     container_name: antigravity-proxy
     restart: unless-stopped
+    user: "10000:10000"
     network_mode: "service:tailscale"
     volumes:
-      - ./data/antigravity:/root/.gemini/antigravity-cli:rw
+      - ./data/antigravity:/home/appuser/.gemini/antigravity-cli:rw
       - ./antigravity_proxy.py:/app/antigravity_proxy.py:ro
     command: python3 /app/antigravity_proxy.py --host 127.0.0.1 --port 8877
     environment:
+      - HOME=/home/appuser
+      - ANTIGRAVITY_TOKEN_FILE=/home/appuser/.gemini/antigravity-cli/antigravity-oauth-token
       - ANTIGRAVITY_CLIENT_ID=${ANTIGRAVITY_CLIENT_ID}
       - ANTIGRAVITY_CLIENT_SECRET=${ANTIGRAVITY_CLIENT_SECRET}
     security_opt:

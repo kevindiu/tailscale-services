@@ -21,7 +21,15 @@ mkdir -p "${DATA_DIR}/hermes"
 chmod 700 "${DATA_DIR}/tailscale"
 chmod 700 "${DATA_DIR}/adguard"
 chmod 700 "${DATA_DIR}/rustdesk"
-chmod 700 "${DATA_DIR}/antigravity"
 chmod 755 "${DATA_DIR}/hermes"
+
+# Antigravity proxy runs as non-root UID 10000:10000
+# Chown to 10000:10000 if running with root/appropriate capabilities,
+# otherwise ensure directory is writable by UID 10000
+if chown 10000:10000 "${DATA_DIR}/antigravity" 2>/dev/null; then
+    chmod 700 "${DATA_DIR}/antigravity"
+else
+    chmod 777 "${DATA_DIR}/antigravity"
+fi
 
 echo "[✓] Directory initialization complete."
