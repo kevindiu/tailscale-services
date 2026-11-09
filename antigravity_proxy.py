@@ -976,6 +976,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except (ValueError, TypeError):
             length = 0
         if length > MAX_PAYLOAD_SIZE:
+            self.close_connection = True
             self._send_error_json("payload_too_large", f"Payload size {length} exceeds {MAX_PAYLOAD_SIZE} limit", err_type="invalid_request_error", http_code=413)
             return None
         if length <= 0:
@@ -1186,6 +1187,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         seen_tool_indexes = set()
+        emitted_tool_keys = set()
         finish_reason = "stop"
         total_usage: dict | None = None
         has_tool_calls = False
@@ -1229,6 +1231,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
                         idx = len(seen_tool_indexes)
                         encoded_id = f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else f"call_{uuid.uuid4().hex[:20]}"
+                        call_key = (fc_id, name) if fc_id else (name, args_str)
+
+                        if call_key in emitted_tool_keys:
+                            continue
+                        emitted_tool_keys.add(call_key)
 
                         if idx not in seen_tool_indexes:
                             seen_tool_indexes.add(idx)
@@ -1243,11 +1250,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 },
                             })
                         else:
-                            # Subsequent chunks stream index and delta arguments
+                            # If ever emitted under same index, do not duplicate arguments string
                             tool_deltas.append({
                                 "index": idx,
                                 "function": {
-                                    "arguments": args_str,
+                                    "arguments": "",
                                 },
                             })
 
