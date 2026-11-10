@@ -44,8 +44,9 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 from urllib.error import HTTPError, URLError
+import urllib3
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration & Constants
@@ -76,6 +77,31 @@ DEFAULT_MODEL = "gemini-3.8-flash"
 UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh 2 mins before expiry
 MAX_PAYLOAD_SIZE = 20 * 1024 * 1024  # 20MB
+
+# Persistent Connection Pool for Upstream APIs
+_HTTP_POOL = urllib3.PoolManager(maxsize=50, retries=False)
+
+
+def _urlopen_pool(req, timeout=30):
+    method = req.get_method()
+    url = req.full_url
+    headers = dict(req.headers)
+    body = req.data
+    resp = _HTTP_POOL.request(
+        method,
+        url,
+        headers=headers,
+        body=body,
+        timeout=timeout,
+        preload_content=False,
+    )
+    if resp.status >= 400:
+        import io
+        from urllib.error import HTTPError
+        data = resp.read()
+        fp = io.BytesIO(data)
+        raise HTTPError(url, resp.status, resp.reason, resp.headers, fp)
+    return resp
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Token & Project State
@@ -167,7 +193,7 @@ def _refresh_access_token(refresh_token: str) -> dict:
     req = Request(OAUTH_TOKEN_URL, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     try:
-        with urlopen(req, timeout=30) as resp:
+        with _urlopen_pool(req, timeout=30) as resp:
             payload = json.loads(resp.read().decode())
     except HTTPError as e:
         detail = ""
@@ -234,7 +260,7 @@ def get_project_id() -> str:
         req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
         req.add_header("Client-Metadata", CLIENT_METADATA)
         try:
-            with urlopen(req, timeout=30) as resp:
+            with _urlopen_pool(req, timeout=30) as resp:
                 payload = json.loads(resp.read().decode())
                 pid = payload.get("cloudaicompanionProject") or payload.get("cloudaicompanion_project")
                 if not pid:
@@ -273,7 +299,7 @@ def get_available_models() -> list[str]:
             req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
             req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
             req.add_header("Client-Metadata", CLIENT_METADATA)
-            with urlopen(req, timeout=15) as resp:
+            with _urlopen_pool(req, timeout=15) as resp:
                 payload = json.loads(resp.read().decode())
                 raw = payload.get("models", [])
                 if raw:
@@ -312,9 +338,16 @@ def record_model_cooldown(model: str, detail_or_message: str):
     """Record an upstream 429 quota exhaustion for a model and calculate its reset timestamp."""
     if not model:
         return
+
+    # Resolve to canonical backend model so cooldown keys match
+    try:
+        canonical_model = resolve_backend_model(model)[0]
+    except Exception:
+        canonical_model = model
+
     reset_epoch = None
-    # 1. Parse quotaResetTimeStamp: 2026-11-14T01:13:20Z
-    m_ts = re.search(r"['\"]?quotaResetTimeStamp['\"]?\s*:\s*['\"]?([0-9T:\-Z\.]+)['\"]?", detail_or_message)
+    # 1. Parse quotaResetTimeStamp: 2026-11-14T01:13:20Z (case-insensitive)
+    m_ts = re.search(r"['\"]?quotaResetTimeStamp['\"]?\s*:\s*['\"]?([0-9T:\-Z\.]+)['\"]?", detail_or_message, re.IGNORECASE)
     if m_ts:
         try:
             ts_str = m_ts.group(1).rstrip("Z") + "+00:00"
@@ -323,57 +356,69 @@ def record_model_cooldown(model: str, detail_or_message: str):
         except Exception:
             pass
 
-    # 2. Parse retryDelay: 310370.5s
+    # 2. Parse retryDelay: 310370.5s (case-insensitive)
     if reset_epoch is None:
-        m_delay = re.search(r"['\"]?retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s?['\"]?", detail_or_message)
+        m_delay = re.search(r"['\"]?retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s?['\"]?", detail_or_message, re.IGNORECASE)
         if m_delay:
             try:
                 reset_epoch = time.time() + float(m_delay.group(1))
             except Exception:
                 pass
 
-    # 3. Default fallback: 1 hour if not specified
+    # 3. Parse natural language reset: "resets in 1h 2m 3s" / "reset in 5m" / etc.
+    if reset_epoch is None:
+        m_nl = re.search(
+            r"resets?\s+in\s+(?:(\d+(?:\.\d+)?)\s*h)?\s*(?:(\d+(?:\.\d+)?)\s*m)?\s*(?:(\d+(?:\.\d+)?)\s*s)?",
+            detail_or_message,
+            re.IGNORECASE,
+        )
+        if m_nl and any(m_nl.groups()):
+            hours = float(m_nl.group(1) or 0)
+            minutes = float(m_nl.group(2) or 0)
+            seconds = float(m_nl.group(3) or 0)
+            total_seconds = hours * 3600 + minutes * 60 + seconds
+            if total_seconds > 0:
+                reset_epoch = time.time() + total_seconds
+
+    # 4. Default fallback: 1 hour if not specified
     if reset_epoch is None:
         reset_epoch = time.time() + 3600
 
     with _MODEL_COOLDOWNS_LOCK:
-        _MODEL_COOLDOWNS[model] = reset_epoch
-        _log(f"[Cooldown] Recorded cooldown for '{model}' until {datetime.fromtimestamp(reset_epoch, tz=timezone.utc).isoformat()}")
+        _MODEL_COOLDOWNS[canonical_model] = reset_epoch
+        _log(f"[Cooldown] Recorded cooldown for '{canonical_model}' until {datetime.fromtimestamp(reset_epoch, tz=timezone.utc).isoformat()}")
 
 
 def is_model_in_cooldown(model: str) -> bool:
     if not model:
         return False
+    keys_to_check = [model]
+    try:
+        resolved = resolve_backend_model(model)[0]
+        if resolved not in keys_to_check:
+            keys_to_check.append(resolved)
+    except Exception:
+        pass
+
+    now = time.time()
     with _MODEL_COOLDOWNS_LOCK:
-        until = _MODEL_COOLDOWNS.get(model)
-        if until is None:
-            return False
-        if time.time() >= until:
-            del _MODEL_COOLDOWNS[model]
-            _log(f"[Cooldown] Cooldown expired for '{model}', restored to service")
-            return False
-        return True
+        in_cooldown = False
+        for key in keys_to_check:
+            until = _MODEL_COOLDOWNS.get(key)
+            if until is not None:
+                if now >= until:
+                    del _MODEL_COOLDOWNS[key]
+                    _log(f"[Cooldown] Cooldown expired for '{key}', restored to service")
+                else:
+                    in_cooldown = True
+        return in_cooldown
 
 
-def get_auto_fallback_model(requested_model: str) -> str:
-    """Return a healthy fallback model if requested_model is in cooldown."""
+def get_auto_fallback_model(requested_model: str) -> str | None:
+    """Return requested_model if not in cooldown, else None."""
     if not is_model_in_cooldown(requested_model):
         return requested_model
-
-    live_models = get_available_models()
-    # Preference chain when a model is exhausted
-    candidates = [
-        "gemini-3.8-flash-low",
-        "gemini-3.8-flash",
-        "gemini-3.8-flash-high",
-        "gemini-3.8-flash-medium",
-        "gemini-2.5-flash",
-        "gemini-2.5-pro",
-    ]
-    for c in candidates:
-        if c in live_models and not is_model_in_cooldown(c):
-            return c
-    return "gemini-3.8-flash-low"
+    return None
 
 
 def select_fallback_candidate(chain: list[str]) -> str | None:
@@ -838,7 +883,7 @@ def _make_upstream_request(url: str, envelope: dict, streaming: bool = False) ->
 def call_generate_content(envelope: dict) -> dict:
     req = _make_upstream_request(GENERATE_CONTENT_URL, envelope, streaming=False)
     try:
-        with urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
+        with _urlopen_pool(req, timeout=UPSTREAM_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode())
             return payload.get("response", payload)
     except HTTPError as e:
@@ -893,7 +938,7 @@ class StreamResponse:
 def stream_generate_content(envelope: dict):
     req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, envelope, streaming=True)
     try:
-        resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
+        resp = _urlopen_pool(req, timeout=UPSTREAM_TIMEOUT)
     except HTTPError as e:
         detail = ""
         try:
@@ -917,7 +962,7 @@ def fetch_quota_summary() -> dict:
     req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
     req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
     req.add_header("Client-Metadata", CLIENT_METADATA)
-    with urlopen(req, timeout=15) as resp:
+    with _urlopen_pool(req, timeout=15) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -2006,6 +2051,7 @@ def main():
     threading.Thread(target=get_available_models, daemon=True).start()
 
     server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
+    server.daemon_threads = True
     _log(f"Listening on http://{args.host}:{args.port}")
     _log("Endpoints active:")
     _log("  • OpenAI Chat:        POST /v1/chat/completions")
