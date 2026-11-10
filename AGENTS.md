@@ -173,5 +173,5 @@ docker compose exec -it hermes hermes config set model.default claude-sonnet-5.5
   - Ensure memory limits, restart policies, and Watchtower labels (`com.centurylinklabs.watchtower.depends-on=tailscale`) are preserved when adding services.
   - Never add host-bound `ports:` mappings. All services must be routed strictly through `network_mode: "service:tailscale"`.
 - **Tailscale DNS Isolation:** Always keep `TS_ACCEPT_DNS=false` on the `tailscale` container to prevent DNS loop deadlocks with AdGuard Home.
-- **Modifying Antigravity Models:** When adding new models, update both `MODEL_MAP` in `antigravity_proxy.py` and `fallback_models` in `data/hermes/plugins/model-providers/antigravity/__init__.py`.
+- **Antigravity Model Management:** `antigravity_proxy.py` uses dynamic model discovery (`get_available_models()`) with cached live catalog queries and graceful fallback defaults. When updating fallback defaults or aliases, verify both `antigravity_proxy.py` and `fallback_models` in `data/hermes/plugins/model-providers/antigravity/__init__.py`.
 - **Handling Secrets:** Never commit `.env` or files under `data/` to git. Never insert real API keys or OAuth secrets into `env.example` or compose fallbacks.

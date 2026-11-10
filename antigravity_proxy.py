@@ -724,38 +724,6 @@ def gemini_response_to_openai(response: dict, model: str) -> dict:
     }
 
 
-def _extract_delta_from_parts(parts: list, prev_tool_names: set) -> tuple[str, list, set]:
-    text_chunks = []
-    tool_call_deltas = []
-    current_names = set(prev_tool_names)
-
-    for part in parts or []:
-        if not isinstance(part, dict):
-            continue
-        if part.get("text"):
-            text_chunks.append(part["text"])
-        if "functionCall" in part:
-            fc = part["functionCall"] or {}
-            name = fc.get("name", "")
-            args = fc.get("args", {})
-            fc_id = fc.get("id", "")
-            thought_sig = part.get("thoughtSignature") or part.get("thought_signature") or ""
-            if name:
-                current_names.add(name)
-                encoded_id = f"call_{fc_id}|{thought_sig}" if (fc_id or thought_sig) else f"call_{uuid.uuid4().hex[:20]}"
-                tool_call_deltas.append({
-                    "index": len(current_names) - 1,
-                    "id": encoded_id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(args) if isinstance(args, (dict, list)) else str(args),
-                    },
-                })
-
-    return "".join(text_chunks), tool_call_deltas, current_names
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Network Client
 # ──────────────────────────────────────────────────────────────────────────────
@@ -883,6 +851,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self._send_cors_headers()
         self.end_headers()
+
+    def _send_sse_headers(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self._send_cors_headers()
+        self.end_headers()
+
+    def _write_sse_event(self, data: str | bytes, event_type: str | None = None) -> bool:
+        try:
+            if event_type:
+                self.wfile.write(f"event: {event_type}\n".encode())
+            if isinstance(data, bytes):
+                self.wfile.write(b"data: " + data + b"\n\n")
+            else:
+                self.wfile.write(f"data: {data}\n\n".encode())
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+        except Exception:
+            return False
 
     def _send_json(self, code: int, data: dict, extra_headers: list[tuple[str, str]] | None = None):
         body = json.dumps(data).encode()
@@ -1157,23 +1149,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self._send_cors_headers()
-        self.end_headers()
-
-        def send_sse(obj: dict) -> bool:
-            try:
-                self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())
-                self.wfile.flush()
-                return True
-            except (BrokenPipeError, ConnectionResetError):
-                return False
-            except Exception:
-                return False
+        self._send_sse_headers()
+        send_sse = lambda obj: self._write_sse_event(json.dumps(obj))
 
         # First role chunk
         if not send_sse({
@@ -1312,22 +1289,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     gen.close()
                     return
 
-            try:
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            self._write_sse_event(b"[DONE]")
         except (BrokenPipeError, ConnectionResetError):
             gen.close()
         except Exception as e:
             _log(f"Stream error: {e}")
             gen.close()
-            try:
-                self.wfile.write(f"data: {json.dumps({'error': {'message': str(e)}})}\n\n".encode())
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-            except Exception:
-                pass
+            self._write_sse_event(json.dumps({'error': {'message': str(e)}}))
+            self._write_sse_event(b"[DONE]")
 
     # ── OpenAI Text Completions Handler (Legacy / Code Completion) ────────────
 
@@ -1380,13 +1349,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             completion_id = f"cmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("X-Accel-Buffering", "no")
-            self._send_cors_headers()
-            self.end_headers()
+            self._send_sse_headers()
 
             stream_resp = None
             try:
@@ -1401,19 +1364,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     parts = (cands[0].get("content") or {}).get("parts") or []
                     delta_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text"))
                     if delta_text:
-                        chunk_payload = f"data: {json.dumps({'id': completion_id, 'object': 'text_completion', 'created': created, 'model': model, 'choices': [{'text': delta_text, 'index': 0, 'finish_reason': None}]})}\n\n".encode()
-                        try:
-                            self.wfile.write(chunk_payload)
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError):
+                        chunk_payload = json.dumps({'id': completion_id, 'object': 'text_completion', 'created': created, 'model': model, 'choices': [{'text': delta_text, 'index': 0, 'finish_reason': None}]})
+                        if not self._write_sse_event(chunk_payload):
                             if stream_resp:
                                 stream_resp.close()
                             break
-                try:
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+                self._write_sse_event(b"[DONE]")
             except (BrokenPipeError, ConnectionResetError):
                 if stream_resp:
                     stream_resp.close()
@@ -1539,23 +1495,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             # Anthropic streaming
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("X-Accel-Buffering", "no")
-            self._send_cors_headers()
-            self.end_headers()
-
-            def send_event(event_type: str, data: dict) -> bool:
-                try:
-                    self.wfile.write(f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode())
-                    self.wfile.flush()
-                    return True
-                except (BrokenPipeError, ConnectionResetError):
-                    return False
-                except Exception:
-                    return False
+            self._send_sse_headers()
+            send_event = lambda event_type, data: self._write_sse_event(json.dumps(data), event_type=event_type)
 
             stream_resp = None
             try:
@@ -1818,13 +1759,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._send_error_json("upstream_error", str(e), http_code=e.status)
         else:
             # streamGenerateContent passthrough
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("X-Accel-Buffering", "no")
-            self._send_cors_headers()
-            self.end_headers()
+            self._send_sse_headers()
 
             stream_resp = None
             try:
@@ -1832,18 +1767,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 for event in stream_resp:
                     if not isinstance(event, dict) or event.get("__done__"):
                         break
-                    try:
-                        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError):
+                    if not self._write_sse_event(json.dumps(event)):
                         if stream_resp:
                             stream_resp.close()
                         break
-                try:
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+                self._write_sse_event(b"[DONE]")
             except (BrokenPipeError, ConnectionResetError):
                 if stream_resp:
                     stream_resp.close()
