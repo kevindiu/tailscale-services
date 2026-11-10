@@ -302,19 +302,98 @@ def get_available_models() -> list[str]:
         ]
 
 
+# Model Cooldown & Auto-Reroute Cache
+# model_name -> expiration timestamp (monotonic or unix)
+_MODEL_COOLDOWNS: dict[str, float] = {}
+_MODEL_COOLDOWNS_LOCK = threading.Lock()
+
+
+def record_model_cooldown(model: str, detail_or_message: str):
+    """Record an upstream 429 quota exhaustion for a model and calculate its reset timestamp."""
+    if not model:
+        return
+    reset_epoch = None
+    # 1. Parse quotaResetTimeStamp: 2026-11-14T01:13:20Z
+    m_ts = re.search(r"['\"]?quotaResetTimeStamp['\"]?\s*:\s*['\"]?([0-9T:\-Z\.]+)['\"]?", detail_or_message)
+    if m_ts:
+        try:
+            ts_str = m_ts.group(1).rstrip("Z") + "+00:00"
+            target_dt = datetime.fromisoformat(ts_str)
+            reset_epoch = target_dt.timestamp()
+        except Exception:
+            pass
+
+    # 2. Parse retryDelay: 310370.5s
+    if reset_epoch is None:
+        m_delay = re.search(r"['\"]?retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s?['\"]?", detail_or_message)
+        if m_delay:
+            try:
+                reset_epoch = time.time() + float(m_delay.group(1))
+            except Exception:
+                pass
+
+    # 3. Default fallback: 1 hour if not specified
+    if reset_epoch is None:
+        reset_epoch = time.time() + 3600
+
+    with _MODEL_COOLDOWNS_LOCK:
+        _MODEL_COOLDOWNS[model] = reset_epoch
+        _log(f"[Auto-Reroute] Recorded cooldown for '{model}' until {datetime.fromtimestamp(reset_epoch, tz=timezone.utc).isoformat()}")
+
+
+def is_model_in_cooldown(model: str) -> bool:
+    if not model:
+        return False
+    with _MODEL_COOLDOWNS_LOCK:
+        until = _MODEL_COOLDOWNS.get(model)
+        if until is None:
+            return False
+        if time.time() >= until:
+            del _MODEL_COOLDOWNS[model]
+            _log(f"[Auto-Reroute] Cooldown expired for '{model}', restored to service")
+            return False
+        return True
+
+
+def get_healthy_fallback_model(requested_model: str) -> str:
+    """Return a healthy fallback model if requested_model is in cooldown."""
+    if not is_model_in_cooldown(requested_model):
+        return requested_model
+
+    # Prefer Flash models which have separate/ample quota
+    live_models = get_available_models()
+    candidates = [
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash",
+        "gemini-3.8-flash-high",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+    ]
+    for c in candidates:
+        if c in live_models and not is_model_in_cooldown(c):
+            _log(f"[Auto-Reroute] Model '{requested_model}' is in cooldown! Automatically rerouting to healthy model '{c}'")
+            return c
+
+    # Fallback to default
+    return "gemini-3.8-flash-low"
+
+
 def resolve_backend_model(requested: str) -> tuple[str, str | None]:
     """Resolve any requested model string to (backend_model_id, thinking_level) dynamically."""
     if not requested:
         return "gemini-3.8-flash-low", None
 
+    # Check auto-reroute cooldown first
+    effective_requested = get_healthy_fallback_model(requested)
+
     live_models = get_available_models()
     # 1. Exact match
-    if requested in live_models:
-        thinking = "high" if "high" in requested else ("low" if "low" in requested else None)
-        return requested, thinking
+    if effective_requested in live_models:
+        thinking = "high" if "high" in effective_requested else ("low" if "low" in effective_requested else None)
+        return effective_requested, thinking
 
     # 2. Normalized match (e.g. 'claude-sonnet-5.5' -> 'claude-sonnet-5-5')
-    norm = requested.replace(".", "-").lower()
+    norm = effective_requested.replace(".", "-").lower()
 
     # Common aliases
     if norm in ("dall-e-3", "dall-e-2", "image", "image-gen"):
@@ -760,6 +839,8 @@ def call_generate_content(envelope: dict) -> dict:
             detail = e.read().decode()
         except Exception:
             pass
+        if e.code == 429 or "RESOURCE_EXHAUSTED" in detail:
+            record_model_cooldown(envelope.get("model", ""), detail)
         raise UpstreamError(f"Upstream HTTP {e.code}: {detail}", status=e.code, body=detail)
     except Exception as e:
         raise UpstreamError(f"Upstream network error: {e}", status=502)
@@ -811,6 +892,8 @@ def stream_generate_content(envelope: dict):
             detail = e.read().decode()
         except Exception:
             pass
+        if e.code == 429 or "RESOURCE_EXHAUSTED" in detail:
+            record_model_cooldown(envelope.get("model", ""), detail)
         raise UpstreamError(f"Upstream stream HTTP {e.code}: {detail}", status=e.code, body=detail)
     except Exception as e:
         raise UpstreamError(f"Upstream stream network error: {e}", status=502)
@@ -1118,8 +1201,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream", False))
         backend_model, thinking_level = resolve_backend_model(openai_model)
 
+        def make_envelope(m, th):
+            return _build_gemini_request(body, m, th)
+
         try:
-            envelope = _build_gemini_request(body, backend_model, thinking_level)
+            envelope = make_envelope(backend_model, thinking_level)
         except Exception as e:
             self._send_error_json("request_error", f"Failed to build request: {e}", http_code=400)
             return
@@ -1127,18 +1213,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if stream:
             stream_options = body.get("stream_options") or {}
             include_usage = bool(stream_options.get("include_usage", False))
-            self._stream_chat(envelope, openai_model, include_usage=include_usage)
+            self._stream_chat(envelope, openai_model, include_usage=include_usage, retry_builder=make_envelope)
         else:
-            self._nonstream_chat(envelope, openai_model)
+            self._nonstream_chat(envelope, openai_model, retry_builder=make_envelope)
 
-    def _nonstream_chat(self, envelope: dict, openai_model: str):
+    def _nonstream_chat(self, envelope: dict, openai_model: str, retry_builder=None):
         try:
             gemini_resp = call_generate_content(envelope)
             self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model))
         except UpstreamError as e:
+            # If 429 quota exhausted and we have a healthy fallback, retry immediately!
+            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder:
+                fallback_model = get_healthy_fallback_model(envelope.get("model", ""))
+                if fallback_model != envelope.get("model"):
+                    try:
+                        new_env = retry_builder(fallback_model, None)
+                        gemini_resp = call_generate_content(new_env)
+                        self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model))
+                        return
+                    except Exception as re_err:
+                        _log(f"[Auto-Reroute] Non-stream retry error: {re_err}")
             self._send_error_json("upstream_error", str(e), http_code=e.status)
 
-    def _stream_chat(self, envelope: dict, openai_model: str, include_usage: bool = False):
+    def _stream_chat(self, envelope: dict, openai_model: str, include_usage: bool = False, retry_builder=None):
         # Peak first event or check for immediate upstream failure BEFORE sending HTTP 200
         gen = None
         first_event = None
@@ -1146,8 +1243,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
             gen = stream_generate_content(envelope)
             first_event = next(gen)
         except UpstreamError as e:
-            self._send_error_json("upstream_error", str(e), http_code=e.status)
-            return
+            # If 429 quota exhausted and we have a healthy fallback, retry immediately before sending headers!
+            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder:
+                fallback_model = get_healthy_fallback_model(envelope.get("model", ""))
+                if fallback_model != envelope.get("model"):
+                    try:
+                        _log(f"[Auto-Reroute] Upstream 429 encountered for '{envelope.get('model')}'. Retrying stream immediately with '{fallback_model}'")
+                        new_env = retry_builder(fallback_model, None)
+                        gen = stream_generate_content(new_env)
+                        first_event = next(gen)
+                    except UpstreamError as re_e:
+                        self._send_error_json("upstream_error", str(re_e), http_code=re_e.status)
+                        return
+                    except Exception as re_err:
+                        self._send_error_json("upstream_error", str(re_err), http_code=502)
+                        return
+            if gen is None and first_event is None:
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+                return
         except StopIteration:
             pass
         except Exception as e:
