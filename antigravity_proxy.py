@@ -355,6 +355,27 @@ def is_model_in_cooldown(model: str) -> bool:
         return True
 
 
+def get_auto_fallback_model(requested_model: str) -> str:
+    """Return a healthy fallback model if requested_model is in cooldown."""
+    if not is_model_in_cooldown(requested_model):
+        return requested_model
+
+    live_models = get_available_models()
+    # Preference chain when a model is exhausted
+    candidates = [
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash",
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+    ]
+    for c in candidates:
+        if c in live_models and not is_model_in_cooldown(c):
+            return c
+    return "gemini-3.8-flash-low"
+
+
 def select_fallback_candidate(chain: list[str]) -> str | None:
     """Find the first healthy model in the specified fallback chain."""
     for m in chain:
@@ -1206,12 +1227,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream", False))
         fallback_chain = self._get_fallback_chain(body)
 
-        # If fallback chain is specified, check if requested model is in cooldown
+        # Check if requested model is in cooldown
         effective_model = openai_model
-        if fallback_chain and is_model_in_cooldown(openai_model):
-            cand = select_fallback_candidate(fallback_chain)
-            if cand:
-                _log(f"[Fallback-Chain] '{openai_model}' is in cooldown. Proactively using fallback candidate '{cand}'")
+        if is_model_in_cooldown(openai_model):
+            if fallback_chain:
+                cand = select_fallback_candidate(fallback_chain)
+            else:
+                cand = get_auto_fallback_model(openai_model)
+            if cand and cand != openai_model:
+                _log(f"[Auto-Fallback] '{openai_model}' is in cooldown. Automatically using healthy fallback model '{cand}'")
                 effective_model = cand
 
         backend_model, thinking_level = resolve_backend_model(effective_model)
@@ -1249,37 +1273,39 @@ class ProxyHandler(BaseHTTPRequestHandler):
             gemini_resp = call_generate_content(envelope)
             self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model))
         except UpstreamError as e:
-            # If 429 quota exhausted and fallback chain provided, try fallback candidates
-            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder and fallback_chain:
-                cand = select_fallback_candidate(fallback_chain)
+            # If 429 quota exhausted, try fallback candidate
+            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder:
+                cand = select_fallback_candidate(fallback_chain) if fallback_chain else get_auto_fallback_model(envelope.get("model", ""))
                 if cand and cand != envelope.get("model"):
                     try:
-                        _log(f"[Fallback-Chain] Upstream 429 on '{envelope.get('model')}'. Trying fallback '{cand}'")
+                        _log(f"[Auto-Fallback] Upstream 429 on '{envelope.get('model')}'. Retrying with '{cand}'")
                         new_env = retry_builder(cand, None)
                         gemini_resp = call_generate_content(new_env)
-                        self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model))
+                        self._send_json(200, gemini_response_to_openai(gemini_resp, cand))
                         return
                     except Exception as re_err:
-                        _log(f"[Fallback-Chain] Non-stream retry error on '{cand}': {re_err}")
+                        _log(f"[Auto-Fallback] Non-stream retry error on '{cand}': {re_err}")
             self._send_error_json("upstream_error", str(e), http_code=e.status)
 
     def _stream_chat(self, envelope: dict, openai_model: str, include_usage: bool = False, retry_builder=None, fallback_chain=None):
         # Peak first event or check for immediate upstream failure BEFORE sending HTTP 200
         gen = None
         first_event = None
+        served_model = openai_model
         try:
             gen = stream_generate_content(envelope)
             first_event = next(gen)
         except UpstreamError as e:
-            # If 429 quota exhausted and fallback chain provided, try fallback candidates before SSE headers
-            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder and fallback_chain:
-                cand = select_fallback_candidate(fallback_chain)
+            # If 429 quota exhausted, try fallback candidate before SSE headers
+            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder:
+                cand = select_fallback_candidate(fallback_chain) if fallback_chain else get_auto_fallback_model(envelope.get("model", ""))
                 if cand and cand != envelope.get("model"):
                     try:
-                        _log(f"[Fallback-Chain] Upstream 429 on '{envelope.get('model')}'. Retrying stream immediately with '{cand}'")
+                        _log(f"[Auto-Fallback] Upstream 429 on '{envelope.get('model')}'. Retrying stream immediately with '{cand}'")
                         new_env = retry_builder(cand, None)
                         gen = stream_generate_content(new_env)
                         first_event = next(gen)
+                        served_model = cand
                     except UpstreamError as re_e:
                         self._send_error_json("upstream_error", str(re_e), http_code=re_e.status)
                         return
@@ -1304,12 +1330,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_sse_headers()
         send_sse = lambda obj: self._write_sse_event(json.dumps(obj))
 
-        # First role chunk
+        # First role chunk with served_model clearly identified
         if not send_sse({
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": openai_model,
+            "model": served_model,
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
         }):
             gen.close()
@@ -1404,7 +1430,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
-                        "model": openai_model,
+                        "model": served_model,
                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                     })
                     if not ok:
@@ -1416,7 +1442,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "id": completion_id,
                 "object": "chat.completion.chunk",
                 "created": created,
-                "model": openai_model,
+                "model": served_model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             }
             if not send_sse(final_chunk):
@@ -1429,7 +1455,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "created": created,
-                    "model": openai_model,
+                    "model": served_model,
                     "choices": [],
                     "usage": {
                         "prompt_tokens": total_usage.get("promptTokenCount", 0),
