@@ -302,7 +302,7 @@ def get_available_models() -> list[str]:
         ]
 
 
-# Model Cooldown & Auto-Reroute Cache
+# Model Cooldown & Fallback Chain Cache
 # model_name -> expiration timestamp (monotonic or unix)
 _MODEL_COOLDOWNS: dict[str, float] = {}
 _MODEL_COOLDOWNS_LOCK = threading.Lock()
@@ -338,7 +338,7 @@ def record_model_cooldown(model: str, detail_or_message: str):
 
     with _MODEL_COOLDOWNS_LOCK:
         _MODEL_COOLDOWNS[model] = reset_epoch
-        _log(f"[Auto-Reroute] Recorded cooldown for '{model}' until {datetime.fromtimestamp(reset_epoch, tz=timezone.utc).isoformat()}")
+        _log(f"[Cooldown] Recorded cooldown for '{model}' until {datetime.fromtimestamp(reset_epoch, tz=timezone.utc).isoformat()}")
 
 
 def is_model_in_cooldown(model: str) -> bool:
@@ -350,32 +350,20 @@ def is_model_in_cooldown(model: str) -> bool:
             return False
         if time.time() >= until:
             del _MODEL_COOLDOWNS[model]
-            _log(f"[Auto-Reroute] Cooldown expired for '{model}', restored to service")
+            _log(f"[Cooldown] Cooldown expired for '{model}', restored to service")
             return False
         return True
 
 
-def get_healthy_fallback_model(requested_model: str) -> str:
-    """Return a healthy fallback model if requested_model is in cooldown."""
-    if not is_model_in_cooldown(requested_model):
-        return requested_model
-
-    # Prefer Flash models which have separate/ample quota
-    live_models = get_available_models()
-    candidates = [
-        "gemini-3.8-flash-low",
-        "gemini-3.8-flash",
-        "gemini-3.8-flash-high",
-        "gemini-2.5-flash",
-        "gemini-2.5-pro",
-    ]
-    for c in candidates:
-        if c in live_models and not is_model_in_cooldown(c):
-            _log(f"[Auto-Reroute] Model '{requested_model}' is in cooldown! Automatically rerouting to healthy model '{c}'")
-            return c
-
-    # Fallback to default
-    return "gemini-3.8-flash-low"
+def select_fallback_candidate(chain: list[str]) -> str | None:
+    """Find the first healthy model in the specified fallback chain."""
+    for m in chain:
+        m_clean = m.strip()
+        if not m_clean:
+            continue
+        if not is_model_in_cooldown(m_clean):
+            return m_clean
+    return None
 
 
 def resolve_backend_model(requested: str) -> tuple[str, str | None]:
@@ -383,10 +371,9 @@ def resolve_backend_model(requested: str) -> tuple[str, str | None]:
     if not requested:
         return "gemini-3.8-flash-low", None
 
-    # Check auto-reroute cooldown first
-    effective_requested = get_healthy_fallback_model(requested)
-
+    effective_requested = requested
     live_models = get_available_models()
+
     # 1. Exact match
     if effective_requested in live_models:
         thinking = "high" if "high" in effective_requested else ("low" if "low" in effective_requested else None)
@@ -1189,6 +1176,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── OpenAI Chat Completions Handler ───────────────────────────────────────
 
+    def _get_fallback_chain(self, body: dict) -> list[str]:
+        """Extract fallback chain from headers or body if explicitly requested.
+        Supports:
+          - Header 'X-Fallback-Chain': 'gemini-4-argon-low, gemini-3.8-flash-medium'
+          - Header 'X-Fallback-Models': '...'
+          - Body 'fallback_chain': ['model1', 'model2']
+        """
+        raw_header = self.headers.get("X-Fallback-Chain") or self.headers.get("X-Fallback-Models")
+        if raw_header:
+            return [m.strip() for m in raw_header.split(",") if m.strip()]
+        if isinstance(body, dict) and "fallback_chain" in body:
+            fb = body.get("fallback_chain")
+            if isinstance(fb, list):
+                return [str(m).strip() for m in fb if str(m).strip()]
+            if isinstance(fb, str):
+                return [m.strip() for m in fb.split(",") if m.strip()]
+        return []
+
     def _handle_chat(self):
         body = self._read_body()
         if body is None:
@@ -1199,13 +1204,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         openai_model = body.get("model") or DEFAULT_MODEL
         stream = bool(body.get("stream", False))
-        backend_model, thinking_level = resolve_backend_model(openai_model)
+        fallback_chain = self._get_fallback_chain(body)
+
+        # If fallback chain is specified, check if requested model is in cooldown
+        effective_model = openai_model
+        if fallback_chain and is_model_in_cooldown(openai_model):
+            cand = select_fallback_candidate(fallback_chain)
+            if cand:
+                _log(f"[Fallback-Chain] '{openai_model}' is in cooldown. Proactively using fallback candidate '{cand}'")
+                effective_model = cand
+
+        backend_model, thinking_level = resolve_backend_model(effective_model)
 
         def make_envelope(m, th):
-            return _build_gemini_request(body, m, th)
+            b_m, t_l = resolve_backend_model(m)
+            return _build_gemini_request(body, b_m, t_l)
 
         try:
-            envelope = make_envelope(backend_model, thinking_level)
+            envelope = make_envelope(effective_model, thinking_level)
         except Exception as e:
             self._send_error_json("request_error", f"Failed to build request: {e}", http_code=400)
             return
@@ -1213,29 +1229,41 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if stream:
             stream_options = body.get("stream_options") or {}
             include_usage = bool(stream_options.get("include_usage", False))
-            self._stream_chat(envelope, openai_model, include_usage=include_usage, retry_builder=make_envelope)
+            self._stream_chat(
+                envelope,
+                effective_model,
+                include_usage=include_usage,
+                retry_builder=make_envelope,
+                fallback_chain=fallback_chain,
+            )
         else:
-            self._nonstream_chat(envelope, openai_model, retry_builder=make_envelope)
+            self._nonstream_chat(
+                envelope,
+                effective_model,
+                retry_builder=make_envelope,
+                fallback_chain=fallback_chain,
+            )
 
-    def _nonstream_chat(self, envelope: dict, openai_model: str, retry_builder=None):
+    def _nonstream_chat(self, envelope: dict, openai_model: str, retry_builder=None, fallback_chain=None):
         try:
             gemini_resp = call_generate_content(envelope)
             self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model))
         except UpstreamError as e:
-            # If 429 quota exhausted and we have a healthy fallback, retry immediately!
-            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder:
-                fallback_model = get_healthy_fallback_model(envelope.get("model", ""))
-                if fallback_model != envelope.get("model"):
+            # If 429 quota exhausted and fallback chain provided, try fallback candidates
+            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder and fallback_chain:
+                cand = select_fallback_candidate(fallback_chain)
+                if cand and cand != envelope.get("model"):
                     try:
-                        new_env = retry_builder(fallback_model, None)
+                        _log(f"[Fallback-Chain] Upstream 429 on '{envelope.get('model')}'. Trying fallback '{cand}'")
+                        new_env = retry_builder(cand, None)
                         gemini_resp = call_generate_content(new_env)
                         self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model))
                         return
                     except Exception as re_err:
-                        _log(f"[Auto-Reroute] Non-stream retry error: {re_err}")
+                        _log(f"[Fallback-Chain] Non-stream retry error on '{cand}': {re_err}")
             self._send_error_json("upstream_error", str(e), http_code=e.status)
 
-    def _stream_chat(self, envelope: dict, openai_model: str, include_usage: bool = False, retry_builder=None):
+    def _stream_chat(self, envelope: dict, openai_model: str, include_usage: bool = False, retry_builder=None, fallback_chain=None):
         # Peak first event or check for immediate upstream failure BEFORE sending HTTP 200
         gen = None
         first_event = None
@@ -1243,13 +1271,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             gen = stream_generate_content(envelope)
             first_event = next(gen)
         except UpstreamError as e:
-            # If 429 quota exhausted and we have a healthy fallback, retry immediately before sending headers!
-            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder:
-                fallback_model = get_healthy_fallback_model(envelope.get("model", ""))
-                if fallback_model != envelope.get("model"):
+            # If 429 quota exhausted and fallback chain provided, try fallback candidates before SSE headers
+            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder and fallback_chain:
+                cand = select_fallback_candidate(fallback_chain)
+                if cand and cand != envelope.get("model"):
                     try:
-                        _log(f"[Auto-Reroute] Upstream 429 encountered for '{envelope.get('model')}'. Retrying stream immediately with '{fallback_model}'")
-                        new_env = retry_builder(fallback_model, None)
+                        _log(f"[Fallback-Chain] Upstream 429 on '{envelope.get('model')}'. Retrying stream immediately with '{cand}'")
+                        new_env = retry_builder(cand, None)
                         gen = stream_generate_content(new_env)
                         first_event = next(gen)
                     except UpstreamError as re_e:
