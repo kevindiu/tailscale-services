@@ -104,9 +104,11 @@ To prevent Tailscale from disconnecting after 180 days:
 
 ### Step 4: AdGuard Home Hardening
 
-1. Find the assigned Tailscale IP in **[Tailscale Machines](https://login.tailscale.com/admin/machines)** (or `http://tailscale-services:3000`).
-2. From an **admin device**, open `http://<TAILSCALE_IP>:3000`.
-3. Complete the setup wizard (set admin username and a strong 16+ character password).
+1. Find the assigned Tailscale IP in **[Tailscale Machines](https://login.tailscale.com/admin/machines)**.
+2. From an **admin device**, access the AdGuard Home Web UI:
+   - **Using `AdGuardHome.template.yaml` (recommended):** The Web UI binds directly to **port 80** (`http://<TAILSCALE_IP>` or `http://tailscale-services`).
+   - **Clean initial setup (no template):** AdGuard's initial setup wizard binds to **port 3000** (`http://<TAILSCALE_IP>:3000`).
+3. Complete the setup wizard (set admin username and a strong 16+ character password) if configuring without a pre-existing config.
 4. **Configure Encrypted Upstream DNS:**
    - In AdGuard, navigate to **Settings → DNS Settings**.
    - Under **Upstream DNS servers**, replace the defaults with encrypted resolvers:

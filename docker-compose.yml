@@ -78,7 +78,7 @@ services:
       tailscale:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "/opt/adguardhome/AdGuardHome --version || exit 1"]
+      test: ["CMD-SHELL", "/opt/adguardhome/AdGuardHome --version && (nc -z -w2 127.0.0.1 53 || test -e /proc/net/tcp || exit 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -95,6 +95,10 @@ services:
     command: hbbs -r ${RUSTDESK_RELAY_HOST:-tailscale-services}:21117 -k _
     volumes:
       - ./data/rustdesk:/root
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     deploy:
       resources:
         limits:
@@ -115,6 +119,10 @@ services:
     command: hbbr -k _
     volumes:
       - ./data/rustdesk:/root
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     deploy:
       resources:
         limits:
@@ -185,7 +193,7 @@ services:
       - HERMES_DASHBOARD_HOST=0.0.0.0
       - HERMES_DASHBOARD_PORT=9119
       - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${HERMES_DASHBOARD_USER:-admin}
-      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${HERMES_DASHBOARD_PASSWORD:-admin}
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${HERMES_DASHBOARD_PASSWORD:?HERMES_DASHBOARD_PASSWORD must be set in .env}
     security_opt:
       - no-new-privileges:true
     cap_drop:

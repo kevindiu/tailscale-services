@@ -24,12 +24,13 @@ chmod 700 "${DATA_DIR}/rustdesk"
 chmod 755 "${DATA_DIR}/hermes"
 
 # Antigravity proxy runs as non-root UID 10000:10000
-# Chown to 10000:10000 if running with root/appropriate capabilities,
-# otherwise ensure directory is writable by UID 10000
+# Chown to 10000:10000 if running with root/appropriate capabilities.
+# If chown fails, set strict permissions (700) and warn the user.
 if chown 10000:10000 "${DATA_DIR}/antigravity" 2>/dev/null; then
     chmod 700 "${DATA_DIR}/antigravity"
 else
-    chmod 777 "${DATA_DIR}/antigravity"
+    chmod 700 "${DATA_DIR}/antigravity"
+    echo "[!] Warning: Could not chown ${DATA_DIR}/antigravity to 10000:10000. Run with sudo if permission errors occur in container."
 fi
 
 echo "[✓] Directory initialization complete."

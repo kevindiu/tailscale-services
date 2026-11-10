@@ -42,6 +42,7 @@ dns:
   ratelimit_whitelist: []
   refuse_any: true
   upstream_dns:
+    - '[/ts.net/]100.100.100.100'
     - tls://dns.quad9.net
     - https://dns.quad9.net/dns-query
     - tls://1.1.1.1
@@ -84,7 +85,8 @@ dns:
   ipset_file: ""
   bootstrap_prefer_ipv6: false
   upstream_timeout: 10s
-  private_networks: []
+  private_networks:
+    - 100.64.0.0/10
   use_private_ptr_resolvers: true
   local_ptr_upstreams:
     - 100.100.100.100
