@@ -1091,9 +1091,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._handle_gemini_passthrough(path)
             else:
                 self._send_error_json("not_found", f"Endpoint {path} not found", http_code=404)
+        except UpstreamError as e:
+            _log(f"POST {path} upstream error: {e}")
+            self._send_error_json("upstream_error", str(e), http_code=e.status)
         except Exception as e:
             _log(f"POST {path} error: {e}\n{traceback.format_exc()}")
-            self._send_error_json("internal_error", str(e), http_code=500)
+            err_msg = str(e)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                self._send_error_json("upstream_error", err_msg, http_code=429)
+            else:
+                self._send_error_json("internal_error", err_msg, http_code=500)
         finally:
             self._log_req("POST", path, 200, time.time() - t0)
 
@@ -1133,9 +1140,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _stream_chat(self, envelope: dict, openai_model: str, include_usage: bool = False):
         # Peak first event or check for immediate upstream failure BEFORE sending HTTP 200
-        gen = stream_generate_content(envelope)
+        gen = None
         first_event = None
         try:
+            gen = stream_generate_content(envelope)
             first_event = next(gen)
         except UpstreamError as e:
             self._send_error_json("upstream_error", str(e), http_code=e.status)
@@ -1144,6 +1152,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             pass
         except Exception as e:
             self._send_error_json("upstream_error", str(e), http_code=502)
+            return
+
+        if gen is None:
             return
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -1349,11 +1360,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             completion_id = f"cmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
-            self._send_sse_headers()
 
             stream_resp = None
             try:
                 stream_resp = stream_generate_content(envelope)
+            except UpstreamError as e:
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+                return
+            except Exception as e:
+                self._send_error_json("upstream_error", str(e), http_code=502)
+                return
+
+            self._send_sse_headers()
+            try:
                 for event in stream_resp:
                     if not isinstance(event, dict) or event.get("__done__"):
                         break
@@ -1495,13 +1514,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             # Anthropic streaming
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-            self._send_sse_headers()
-            send_event = lambda event_type, data: self._write_sse_event(json.dumps(data), event_type=event_type)
 
             stream_resp = None
             try:
                 stream_resp = stream_generate_content(envelope)
+            except UpstreamError as e:
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+                return
+            except Exception as e:
+                self._send_error_json("upstream_error", str(e), http_code=502)
+                return
 
+            self._send_sse_headers()
+            send_event = lambda event_type, data: self._write_sse_event(json.dumps(data), event_type=event_type)
+
+            try:
                 # Pre-calculate approximate prompt tokens
                 approx_prompt_tokens = 0
                 for m in conv_messages:
@@ -1759,11 +1786,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._send_error_json("upstream_error", str(e), http_code=e.status)
         else:
             # streamGenerateContent passthrough
-            self._send_sse_headers()
-
             stream_resp = None
             try:
                 stream_resp = stream_generate_content(envelope)
+            except UpstreamError as e:
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+                return
+            except Exception as e:
+                self._send_error_json("upstream_error", str(e), http_code=502)
+                return
+
+            self._send_sse_headers()
+
+            try:
                 for event in stream_resp:
                     if not isinstance(event, dict) or event.get("__done__"):
                         break
