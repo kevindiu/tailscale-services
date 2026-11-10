@@ -943,12 +943,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_cors_headers()
         self.end_headers()
 
-    def _send_sse_headers(self):
+    def _send_sse_headers(self, served_model: str | None = None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.send_header("X-Accel-Buffering", "no")
+        if served_model:
+            self.send_header("x-litellm-model-id", served_model)
+            self.send_header("X-Served-Model", served_model)
         self._send_cors_headers()
         self.end_headers()
 
@@ -1271,7 +1274,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _nonstream_chat(self, envelope: dict, openai_model: str, retry_builder=None, fallback_chain=None):
         try:
             gemini_resp = call_generate_content(envelope)
-            self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model))
+            headers = [("x-litellm-model-id", openai_model), ("X-Served-Model", openai_model)]
+            self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model), extra_headers=headers)
         except UpstreamError as e:
             # If 429 quota exhausted, try fallback candidate
             if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder:
@@ -1281,7 +1285,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         _log(f"[Auto-Fallback] Upstream 429 on '{envelope.get('model')}'. Retrying with '{cand}'")
                         new_env = retry_builder(cand, None)
                         gemini_resp = call_generate_content(new_env)
-                        self._send_json(200, gemini_response_to_openai(gemini_resp, cand))
+                        headers = [("x-litellm-model-id", cand), ("X-Served-Model", cand)]
+                        self._send_json(200, gemini_response_to_openai(gemini_resp, cand), extra_headers=headers)
                         return
                     except Exception as re_err:
                         _log(f"[Auto-Fallback] Non-stream retry error on '{cand}': {re_err}")
@@ -1327,7 +1332,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
-        self._send_sse_headers()
+        self._send_sse_headers(served_model=served_model)
         send_sse = lambda obj: self._write_sse_event(json.dumps(obj))
 
         # First role chunk with served_model clearly identified
