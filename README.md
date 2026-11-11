@@ -39,7 +39,8 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 ```
 
 ### Security Invariants
-- **No WAN / Open Resolver risk:** No ports are mapped to the host (`ports:` omitted). AdGuard Home is physically unreachable by the public internet or external port scanners.
+- **No WAN / Open Resolver risk:** No application service ports (DNS, Web, RustDesk, Agent) are mapped to the host interface. AdGuard Home is physically unreachable by the public internet or external port scanners.
+- **Fixed WireGuard UDP Port (iOS / Mobile Drop Mitigation):** Maps `41641:41641/udp` directly to Tailscale. This prevents Docker from assigning ephemeral, shifting outbound ports upon container restart, eliminating the "silent blackhole" connection drops on iOS/iPadOS clients.
 - **Tailscale ACL isolation:** Devices on your Tailnet can send DNS queries to port `53`, but only designated admin devices can reach the AdGuard dashboard, RustDesk ports, or Hermes Agent API.
 - **Isolated Container Boundary (Hermes AI Agent & Antigravity):**
   - **Zero Host Processes:** Both Hermes and the Antigravity bridge run 100% inside Docker. No scripts or services run on your Mac.

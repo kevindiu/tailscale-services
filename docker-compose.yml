@@ -15,13 +15,15 @@ services:
     hostname: ${TAILSCALE_HOSTNAME:-tailscale-services}
     environment:
       - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_AUTH_ONCE=true
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
       - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---advertise-exit-node}
       # Prevent DNS deadlock/loops: daemon always resolves coordination server via host DNS
       - TS_ACCEPT_DNS=false
       # Clamp MSS to PMTU prevents packet blackholes on Exit Node forwarding (PPPoE / MTU mismatch)
-      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
+      # Fixed WireGuard port prevents iOS/mobile P2P connection drops across container restarts
+      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0 --port=41641
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv6.conf.all.forwarding=1
@@ -47,8 +49,13 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
-    # SECURITY NOTE: Do NOT expose ports to the host interface on a public VPS.
-    # Leaving ports unmapped guarantees traffic is reachable ONLY via your private Tailscale network.
+    # Fixed UDP port mapping for Tailscale WireGuard direct connections.
+    # Prevents Docker from assigning random ephemeral ports on container restart,
+    # eliminating the "silent blackhole" connection drop on iOS/iPadOS clients.
+    ports:
+      - "41641:41641/udp"
+    # SECURITY NOTE: Do NOT expose internal service ports (DNS, Web UI, RustDesk) to the host interface on a public VPS.
+    # Leaving internal service ports unmapped guarantees traffic is reachable ONLY via your private Tailscale network.
     # ports:
     #   - "53:53/tcp"
     #   - "53:53/udp"
