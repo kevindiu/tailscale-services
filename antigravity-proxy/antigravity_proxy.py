@@ -1037,7 +1037,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
         self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Expose-Headers", "X-Served-Model, x-litellm-model-id, Content-Length, Content-Type")
+        self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Type")
         self.send_header("Access-Control-Max-Age", "86400")
 
     def send_response(self, code, message=None):
@@ -1051,15 +1051,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self._log_req("OPTIONS", self.path, time.time() - t0)
 
-    def _send_sse_headers(self, served_model: str | None = None):
+    def _send_sse_headers(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.send_header("X-Accel-Buffering", "no")
-        if served_model:
-            self.send_header("x-litellm-model-id", served_model)
-            self.send_header("X-Served-Model", served_model)
         self._send_cors_headers()
         self.end_headers()
 
@@ -1342,27 +1339,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         openai_model = body.get("model") or get_default_model()
         stream = bool(body.get("stream", False))
-        fallback_chain = self._get_fallback_chain(body)
 
-        # Check if requested model is in cooldown
-        effective_model = openai_model
-        if is_model_in_cooldown(openai_model):
-            if fallback_chain:
-                cand = select_fallback_candidate(fallback_chain)
-            else:
-                cand = get_auto_fallback_model(openai_model)
-            if cand and cand != openai_model:
-                _log(f"[Auto-Fallback] '{openai_model}' is in cooldown. Automatically using healthy fallback model '{cand}'")
-                effective_model = cand
-
-        backend_model = resolve_backend_model(effective_model)
-
-        def make_envelope(m, _=None):
-            b_m = resolve_backend_model(m)
-            return _build_gemini_request(body, b_m)
+        backend_model = resolve_backend_model(openai_model)
 
         try:
-            envelope = make_envelope(effective_model)
+            envelope = _build_gemini_request(body, backend_model)
         except Exception as e:
             self._send_error_json("request_error", f"Failed to build request: {e}", http_code=400)
             return
@@ -1372,89 +1353,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
             include_usage = bool(stream_options.get("include_usage", False))
             self._stream_chat(
                 envelope,
-                effective_model,
+                openai_model,
                 include_usage=include_usage,
-                retry_builder=make_envelope,
-                fallback_chain=fallback_chain,
             )
         else:
             self._nonstream_chat(
                 envelope,
-                effective_model,
-                retry_builder=make_envelope,
-                fallback_chain=fallback_chain,
+                openai_model,
             )
 
-    def _nonstream_chat(self, envelope: dict, openai_model: str, retry_builder=None, fallback_chain=None):
+    def _nonstream_chat(self, envelope: dict, openai_model: str):
         try:
             gemini_resp = call_generate_content(envelope)
-            headers = [("x-litellm-model-id", openai_model), ("X-Served-Model", openai_model)]
-            self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model), extra_headers=headers)
+            self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model))
         except UpstreamError as e:
-            # If 429 quota exhausted, loop through fallback candidates sequentially
-            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder and fallback_chain:
-                tried = {openai_model, envelope.get("model", "")}
-                while True:
-                    cand = select_fallback_candidate(fallback_chain)
-                    if not cand or cand in tried:
-                        break
-                    tried.add(cand)
-                    try:
-                        _log(f"[Auto-Fallback] Upstream 429 on '{envelope.get('model')}'. Retrying with candidate '{cand}'")
-                        new_env = retry_builder(cand, None)
-                        gemini_resp = call_generate_content(new_env)
-                        headers = [("x-litellm-model-id", cand), ("X-Served-Model", cand)]
-                        self._send_json(200, gemini_response_to_openai(gemini_resp, cand), extra_headers=headers)
-                        return
-                    except UpstreamError as re_err:
-                        _log(f"[Auto-Fallback] Non-stream retry error on '{cand}': {re_err}")
-                        if re_err.status != 429 and "RESOURCE_EXHAUSTED" not in str(re_err):
-                            break
-                    except Exception as re_err:
-                        _log(f"[Auto-Fallback] Non-stream retry exception on '{cand}': {re_err}")
-                        break
             self._send_error_json("upstream_error", str(e), http_code=e.status)
 
-    def _stream_chat(self, envelope: dict, openai_model: str, include_usage: bool = False, retry_builder=None, fallback_chain=None):
+    def _stream_chat(self, envelope: dict, openai_model: str, include_usage: bool = False):
         # Peak first event or check for immediate upstream failure BEFORE sending HTTP 200
         gen = None
         first_event = None
-        served_model = openai_model
         try:
             gen = stream_generate_content(envelope)
             first_event = next(gen)
         except UpstreamError as e:
-            # If 429 quota exhausted, loop through fallback candidates sequentially before SSE headers
-            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder and fallback_chain:
-                tried = {openai_model, envelope.get("model", "")}
-                while True:
-                    cand = select_fallback_candidate(fallback_chain)
-                    if not cand or cand in tried:
-                        break
-                    tried.add(cand)
-                    try:
-                        _log(f"[Auto-Fallback] Upstream 429 on stream. Retrying immediately with candidate '{cand}'")
-                        new_env = retry_builder(cand, None)
-                        gen = stream_generate_content(new_env)
-                        first_event = next(gen)
-                        served_model = cand
-                        break
-                    except UpstreamError as re_err:
-                        if gen:
-                            gen.close()
-                            gen = None
-                        _log(f"[Auto-Fallback] Stream retry error on '{cand}': {re_err}")
-                        if re_err.status != 429 and "RESOURCE_EXHAUSTED" not in str(re_err):
-                            break
-                    except Exception as re_err:
-                        if gen:
-                            gen.close()
-                            gen = None
-                        _log(f"[Auto-Fallback] Stream retry exception on '{cand}': {re_err}")
-                        break
-            if gen is None or first_event is None:
-                self._send_error_json("upstream_error", str(e), http_code=e.status)
-                return
+            self._send_error_json("upstream_error", str(e), http_code=e.status)
+            return
         except StopIteration:
             pass
         except Exception as e:
@@ -1469,15 +1393,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
-        self._send_sse_headers(served_model=served_model)
+        self._send_sse_headers()
         send_sse = lambda obj: self._write_sse_event(json.dumps(obj))
 
-        # First role chunk with served_model clearly identified
+        # First role chunk
         if not send_sse({
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": served_model,
+            "model": openai_model,
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
         }):
             gen.close()
@@ -1572,7 +1496,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
-                        "model": served_model,
+                        "model": openai_model,
                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                     })
                     if not ok:
@@ -1584,7 +1508,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "id": completion_id,
                 "object": "chat.completion.chunk",
                 "created": created,
-                "model": served_model,
+                "model": openai_model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             }
             if not send_sse(final_chunk):
@@ -1597,7 +1521,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "created": created,
-                    "model": served_model,
+                    "model": openai_model,
                     "choices": [],
                     "usage": {
                         "prompt_tokens": total_usage.get("promptTokenCount", 0),
@@ -1656,7 +1580,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 cand = (gemini_resp.get("candidates") or [{}])[0]
                 parts = (cand.get("content") or {}).get("parts") or []
                 text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
-                headers = [("x-litellm-model-id", model), ("X-Served-Model", model)]
                 self._send_json(200, {
                     "id": f"cmpl-{uuid.uuid4().hex[:24]}",
                     "object": "text_completion",
@@ -1664,7 +1587,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "model": model,
                     "choices": [{"text": text, "index": 0, "logprobs": None, "finish_reason": "stop"}],
                     "usage": _extract_usage(gemini_resp),
-                }, extra_headers=headers)
+                })
             except UpstreamError as e:
                 self._send_error_json("upstream_error", str(e), http_code=e.status)
         else:
@@ -1681,7 +1604,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._send_error_json("upstream_error", str(e), http_code=502)
                 return
 
-            self._send_sse_headers(served_model=model)
+            self._send_sse_headers()
             try:
                 for event in stream_resp:
                     if not isinstance(event, dict) or event.get("__done__"):
@@ -1851,17 +1774,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 })
 
             usage = _extract_usage(gemini_resp)
-            headers = [("x-litellm-model-id", served_model), ("X-Served-Model", served_model)]
             self._send_json(200, {
                 "id": f"msg_{uuid.uuid4().hex[:24]}",
                 "type": "message",
                 "role": "assistant",
                 "content": content_blocks,
-                "model": served_model,
+                "model": model,
                 "stop_reason": "tool_use" if tool_calls else "end_turn",
                 "stop_sequence": None,
                 "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]},
-            }, extra_headers=headers)
+            })
         else:
             # Anthropic streaming
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -1898,7 +1820,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._send_error_json("upstream_error", str(e), http_code=502)
                 return
 
-            self._send_sse_headers(served_model=served_model)
+            self._send_sse_headers()
             send_event = lambda event_type, data: self._write_sse_event(json.dumps(data), event_type=event_type)
 
             try:
@@ -1918,7 +1840,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "id": msg_id,
                         "type": "message",
                         "role": "assistant",
-                        "model": served_model,
+                        "model": model,
                         "content": [],
                         "stop_reason": None,
                         "stop_sequence": None,
@@ -2156,8 +2078,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if action == "generateContent":
             try:
                 gemini_resp = call_generate_content(envelope)
-                headers = [("x-litellm-model-id", model), ("X-Served-Model", model)]
-                self._send_json(200, gemini_resp, extra_headers=headers)
+                self._send_json(200, gemini_resp)
             except UpstreamError as e:
                 self._send_error_json("upstream_error", str(e), http_code=e.status)
         else:
@@ -2172,7 +2093,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._send_error_json("upstream_error", str(e), http_code=502)
                 return
 
-            self._send_sse_headers(served_model=model)
+            self._send_sse_headers()
 
             try:
                 for event in stream_resp:
