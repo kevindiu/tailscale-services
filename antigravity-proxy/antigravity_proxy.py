@@ -1440,10 +1440,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         served_model = cand
                         break
                     except UpstreamError as re_err:
+                        if gen:
+                            gen.close()
+                            gen = None
                         _log(f"[Auto-Fallback] Stream retry error on '{cand}': {re_err}")
                         if re_err.status != 429 and "RESOURCE_EXHAUSTED" not in str(re_err):
                             break
                     except Exception as re_err:
+                        if gen:
+                            gen.close()
+                            gen = None
                         _log(f"[Auto-Fallback] Stream retry exception on '{cand}': {re_err}")
                         break
             if gen is None or first_event is None:
@@ -1452,6 +1458,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except StopIteration:
             pass
         except Exception as e:
+            if gen:
+                gen.close()
             self._send_error_json("upstream_error", str(e), http_code=502)
             return
 
@@ -1877,11 +1885,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             served_model = cand
                             break
                         except Exception as re_err:
+                            if stream_resp:
+                                stream_resp.close()
+                                stream_resp = None
                             _log(f"[Auto-Fallback] Anthropic stream retry on '{cand}' failed: {re_err}")
                 if stream_resp is None:
                     self._send_error_json("upstream_error", str(e), http_code=e.status)
                     return
             except Exception as e:
+                if stream_resp:
+                    stream_resp.close()
                 self._send_error_json("upstream_error", str(e), http_code=502)
                 return
 
