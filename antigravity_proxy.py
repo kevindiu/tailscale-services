@@ -44,9 +44,8 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
-from urllib.request import Request
+from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-import urllib3
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration & Constants
@@ -73,35 +72,26 @@ CLIENT_METADATA = json.dumps(
 )
 
 DEFAULT_SYSTEM_INSTRUCTION = "You are a helpful AI assistant."
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = os.environ.get("ANTIGRAVITY_DEFAULT_MODEL", "")
+
+
+def get_default_model() -> str:
+    if DEFAULT_MODEL:
+        return DEFAULT_MODEL
+    live = get_available_models()
+    if not live:
+        return ""
+    for pref in ("flash", "sonnet", "chat"):
+        cand = next((m for m in live if pref in m.lower() and not m.startswith("tab_") and not m.startswith("chat_")), None)
+        if cand:
+            return cand
+    return live[0]
 UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh 2 mins before expiry
 MAX_PAYLOAD_SIZE = 20 * 1024 * 1024  # 20MB
 
 # Persistent Connection Pool for Upstream APIs
-_HTTP_POOL = urllib3.PoolManager(maxsize=50, retries=False)
-
-
-def _urlopen_pool(req, timeout=30):
-    method = req.get_method()
-    url = req.full_url
-    headers = dict(req.headers)
-    body = req.data
-    resp = _HTTP_POOL.request(
-        method,
-        url,
-        headers=headers,
-        body=body,
-        timeout=timeout,
-        preload_content=False,
-    )
-    if resp.status >= 400:
-        import io
-        from urllib.error import HTTPError
-        data = resp.read()
-        fp = io.BytesIO(data)
-        raise HTTPError(url, resp.status, resp.reason, resp.headers, fp)
-    return resp
+# (Using standard library urllib.request for zero-dependency portability)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Token & Project State
@@ -109,6 +99,7 @@ def _urlopen_pool(req, timeout=30):
 
 _token_lock = threading.Lock()
 _cached_access_token: str | None = None
+_cached_token_expiry_ts: float = 0.0
 
 _project_lock = threading.Lock()
 _cached_project_id: str | None = None
@@ -193,7 +184,7 @@ def _refresh_access_token(refresh_token: str) -> dict:
     req = Request(OAUTH_TOKEN_URL, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     try:
-        with _urlopen_pool(req, timeout=30) as resp:
+        with urlopen(req, timeout=30) as resp:
             payload = json.loads(resp.read().decode())
     except HTTPError as e:
         detail = ""
@@ -216,11 +207,18 @@ def _refresh_access_token(refresh_token: str) -> dict:
 
 
 def get_access_token() -> str:
-    global _cached_access_token
-    # Quick check outside lock
+    global _cached_access_token, _cached_token_expiry_ts
     now = time.time()
-    # Lock for double-checked token validity
+    # Fast path: use valid in-memory cached token without lock or disk I/O
+    if _cached_access_token and (now < _cached_token_expiry_ts - TOKEN_REFRESH_SKEW):
+        return _cached_access_token
+
     with _token_lock:
+        now = time.time()
+        # Double check inside lock
+        if _cached_access_token and (now < _cached_token_expiry_ts - TOKEN_REFRESH_SKEW):
+            return _cached_access_token
+
         data = _read_token_from_disk()
         if not data:
             raise RuntimeError(f"No OAuth token found at {TOKEN_FILE}.")
@@ -229,9 +227,10 @@ def get_access_token() -> str:
         expiry_ts = _parse_expiry(token_obj.get("expiry"))
         now = time.time()
 
-        # If disk token is still valid (another thread/process may have refreshed it), use it
+        # If disk token is still valid (e.g. refreshed externally), use it
         if access_token and expiry_ts > 0.0 and (expiry_ts - now) >= TOKEN_REFRESH_SKEW:
             _cached_access_token = access_token
+            _cached_token_expiry_ts = expiry_ts
             return access_token
 
         refresh_token = token_obj.get("refresh_token")
@@ -244,6 +243,7 @@ def get_access_token() -> str:
         access_token = new_tok["access_token"]
 
         _cached_access_token = access_token
+        _cached_token_expiry_ts = _parse_expiry(new_tok.get("expiry"))
         return access_token
 
 
@@ -260,7 +260,7 @@ def get_project_id() -> str:
         req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
         req.add_header("Client-Metadata", CLIENT_METADATA)
         try:
-            with _urlopen_pool(req, timeout=30) as resp:
+            with urlopen(req, timeout=30) as resp:
                 payload = json.loads(resp.read().decode())
                 pid = payload.get("cloudaicompanionProject") or payload.get("cloudaicompanion_project")
                 if not pid:
@@ -299,7 +299,7 @@ def get_available_models() -> list[str]:
             req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
             req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
             req.add_header("Client-Metadata", CLIENT_METADATA)
-            with _urlopen_pool(req, timeout=15) as resp:
+            with urlopen(req, timeout=15) as resp:
                 payload = json.loads(resp.read().decode())
                 raw = payload.get("models", [])
                 if raw:
@@ -309,23 +309,11 @@ def get_available_models() -> list[str]:
                     _log(f"Discovered {len(valid_models)} live models from Google")
                     return valid_models
         except Exception as e:
-            _log(f"Live model fetch error (using fallback): {e}")
+            _log(f"Live model fetch error: {e}")
             if _cached_models:
                 return _cached_models
 
-        # Minimal fallback if network discovery blips
-        return [
-            "gemini-3.8-flash-low",
-            "gemini-3.8-flash-high",
-            "gemini-4-argon-medium",
-            "claude-sonnet-5-5-medium",
-            "claude-sonnet-5-5-high",
-            "claude-opus-5-5-medium",
-            "gpt-oss-120b-medium",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "gemini-3.1-flash-image",
-        ]
+        return _cached_models or []
 
 
 # Model Cooldown & Fallback Chain Cache
@@ -414,6 +402,26 @@ def is_model_in_cooldown(model: str) -> bool:
         return in_cooldown
 
 
+def get_active_cooldowns() -> dict[str, dict[str, Any]]:
+    """Return dictionary of currently active model cooldowns with seconds remaining."""
+    now = time.time()
+    active = {}
+    with _MODEL_COOLDOWNS_LOCK:
+        expired = []
+        for model, until in _MODEL_COOLDOWNS.items():
+            rem = until - now
+            if rem <= 0:
+                expired.append(model)
+            else:
+                active[model] = {
+                    "resets_in_seconds": round(rem, 1),
+                    "reset_at": datetime.fromtimestamp(until, tz=timezone.utc).isoformat(),
+                }
+        for model in expired:
+            del _MODEL_COOLDOWNS[model]
+    return active
+
+
 def get_auto_fallback_model(requested_model: str) -> str | None:
     """Return requested_model if not in cooldown, else None."""
     if not is_model_in_cooldown(requested_model):
@@ -434,11 +442,12 @@ def select_fallback_candidate(chain: list[str]) -> str | None:
 
 def resolve_backend_model(requested: str) -> tuple[str, str | None]:
     """Resolve any requested model string to (backend_model_id, thinking_level) dynamically."""
+    live_models = get_available_models()
     if not requested:
-        return "gemini-3.8-flash-low", None
+        fallback = get_default_model() or (live_models[0] if live_models else "")
+        return fallback, None
 
     effective_requested = requested
-    live_models = get_available_models()
 
     # 1. Exact match
     if effective_requested in live_models:
@@ -450,7 +459,9 @@ def resolve_backend_model(requested: str) -> tuple[str, str | None]:
 
     # Common aliases
     if norm in ("dall-e-3", "dall-e-2", "image", "image-gen"):
-        return "gemini-3.1-flash-image", None
+        img_model = next((m for m in live_models if "image" in m.lower()), "")
+        if img_model:
+            return img_model, None
     if norm in ("claude-sonnet", "sonnet", "claude-3-5-sonnet", "claude-3-7-sonnet"):
         norm = "claude-sonnet-5-5"
     elif norm in ("claude-opus", "opus"):
@@ -473,7 +484,7 @@ def resolve_backend_model(requested: str) -> tuple[str, str | None]:
         return chosen, thinking
 
     # Default fallback
-    return "gemini-3.8-flash-low", None
+    return requested, None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -883,7 +894,7 @@ def _make_upstream_request(url: str, envelope: dict, streaming: bool = False) ->
 def call_generate_content(envelope: dict) -> dict:
     req = _make_upstream_request(GENERATE_CONTENT_URL, envelope, streaming=False)
     try:
-        with _urlopen_pool(req, timeout=UPSTREAM_TIMEOUT) as resp:
+        with urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode())
             return payload.get("response", payload)
     except HTTPError as e:
@@ -938,7 +949,7 @@ class StreamResponse:
 def stream_generate_content(envelope: dict):
     req = _make_upstream_request(STREAM_GENERATE_CONTENT_URL, envelope, streaming=True)
     try:
-        resp = _urlopen_pool(req, timeout=UPSTREAM_TIMEOUT)
+        resp = urlopen(req, timeout=UPSTREAM_TIMEOUT)
     except HTTPError as e:
         detail = ""
         try:
@@ -962,7 +973,7 @@ def fetch_quota_summary() -> dict:
     req.add_header("User-Agent", ANTIGRAVITY_USER_AGENT)
     req.add_header("X-Goog-Api-Client", "google-cloud-sdk vscode_cloudshelleditor/0.1")
     req.add_header("Client-Metadata", CLIENT_METADATA)
-    with _urlopen_pool(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -1131,9 +1142,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {
                     "status": "ok",
                     "service": "antigravity-proxy",
-                    "version": "2.1.0",
+                    "version": "2.2.0",
                     "project_id": get_project_id(),
-                    "default_model": DEFAULT_MODEL,
+                    "default_model": get_default_model(),
+                    "active_cooldowns": get_active_cooldowns(),
                 })
             elif path in ("/v1/models", "/models"):
                 self._handle_models_openai()
@@ -1157,21 +1169,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         data = []
         seen = set()
 
-        # Add clean friendly aliases
-        for friendly in (
-            "gemini-3.8-flash", "gemini-3.8-flash-high", "gemini-4-argon",
-            "claude-sonnet-5.5", "claude-sonnet-5.5-high", "claude-opus-5.5",
-            "gpt-oss-120b", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-3.1-flash-image"
-        ):
-            if friendly not in seen:
-                data.append({"id": friendly, "object": "model", "created": now, "owned_by": "google"})
-                seen.add(friendly)
-
-        # Add all exact live backend models
+        # Add all exact live backend models and dynamic dot-formatted aliases
         for m in live_models:
             if m not in seen:
                 data.append({"id": m, "object": "model", "created": now, "owned_by": "google"})
                 seen.add(m)
+            dot_alias = re.sub(r"-(\d+)-(\d+)", r"-\1.\2", m)
+            if dot_alias != m and dot_alias not in seen:
+                data.append({"id": dot_alias, "object": "model", "created": now, "owned_by": "google"})
+                seen.add(dot_alias)
 
         self._send_json(200, {"object": "list", "data": data})
 
@@ -1207,6 +1213,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "status": "ok",
                 "project_id": get_project_id(),
+                "active_cooldowns": get_active_cooldowns(),
                 "quota": quota,
             })
         except Exception as e:
@@ -1226,6 +1233,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._handle_anthropic_messages()
             elif path in ("/v1/images/generations", "/images/generations"):
                 self._handle_images()
+            elif path in ("/v1/cooldown/clear", "/cooldown/clear"):
+                with _MODEL_COOLDOWNS_LOCK:
+                    _MODEL_COOLDOWNS.clear()
+                self._send_json(200, {"status": "ok", "message": "All model cooldowns cleared"})
             elif _GEMINI_PASSTHROUGH_RE.match(path):
                 self._handle_gemini_passthrough(path)
             else:
@@ -1271,7 +1282,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
             return
 
-        openai_model = body.get("model") or DEFAULT_MODEL
+        openai_model = body.get("model") or get_default_model()
         stream = bool(body.get("stream", False))
         fallback_chain = self._get_fallback_chain(body)
 
@@ -1322,19 +1333,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
             headers = [("x-litellm-model-id", openai_model), ("X-Served-Model", openai_model)]
             self._send_json(200, gemini_response_to_openai(gemini_resp, openai_model), extra_headers=headers)
         except UpstreamError as e:
-            # If 429 quota exhausted, try fallback candidate
-            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder:
-                cand = select_fallback_candidate(fallback_chain) if fallback_chain else get_auto_fallback_model(envelope.get("model", ""))
-                if cand and cand != envelope.get("model"):
+            # If 429 quota exhausted, loop through fallback candidates sequentially
+            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder and fallback_chain:
+                tried = {openai_model, envelope.get("model", "")}
+                while True:
+                    cand = select_fallback_candidate(fallback_chain)
+                    if not cand or cand in tried:
+                        break
+                    tried.add(cand)
                     try:
-                        _log(f"[Auto-Fallback] Upstream 429 on '{envelope.get('model')}'. Retrying with '{cand}'")
+                        _log(f"[Auto-Fallback] Upstream 429 on '{envelope.get('model')}'. Retrying with candidate '{cand}'")
                         new_env = retry_builder(cand, None)
                         gemini_resp = call_generate_content(new_env)
                         headers = [("x-litellm-model-id", cand), ("X-Served-Model", cand)]
                         self._send_json(200, gemini_response_to_openai(gemini_resp, cand), extra_headers=headers)
                         return
-                    except Exception as re_err:
+                    except UpstreamError as re_err:
                         _log(f"[Auto-Fallback] Non-stream retry error on '{cand}': {re_err}")
+                        if re_err.status != 429 and "RESOURCE_EXHAUSTED" not in str(re_err):
+                            break
+                    except Exception as re_err:
+                        _log(f"[Auto-Fallback] Non-stream retry exception on '{cand}': {re_err}")
+                        break
             self._send_error_json("upstream_error", str(e), http_code=e.status)
 
     def _stream_chat(self, envelope: dict, openai_model: str, include_usage: bool = False, retry_builder=None, fallback_chain=None):
@@ -1346,23 +1366,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
             gen = stream_generate_content(envelope)
             first_event = next(gen)
         except UpstreamError as e:
-            # If 429 quota exhausted, try fallback candidate before SSE headers
-            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder:
-                cand = select_fallback_candidate(fallback_chain) if fallback_chain else get_auto_fallback_model(envelope.get("model", ""))
-                if cand and cand != envelope.get("model"):
+            # If 429 quota exhausted, loop through fallback candidates sequentially before SSE headers
+            if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and retry_builder and fallback_chain:
+                tried = {openai_model, envelope.get("model", "")}
+                while True:
+                    cand = select_fallback_candidate(fallback_chain)
+                    if not cand or cand in tried:
+                        break
+                    tried.add(cand)
                     try:
-                        _log(f"[Auto-Fallback] Upstream 429 on '{envelope.get('model')}'. Retrying stream immediately with '{cand}'")
+                        _log(f"[Auto-Fallback] Upstream 429 on stream. Retrying immediately with candidate '{cand}'")
                         new_env = retry_builder(cand, None)
                         gen = stream_generate_content(new_env)
                         first_event = next(gen)
                         served_model = cand
-                    except UpstreamError as re_e:
-                        self._send_error_json("upstream_error", str(re_e), http_code=re_e.status)
-                        return
+                        break
+                    except UpstreamError as re_err:
+                        _log(f"[Auto-Fallback] Stream retry error on '{cand}': {re_err}")
+                        if re_err.status != 429 and "RESOURCE_EXHAUSTED" not in str(re_err):
+                            break
                     except Exception as re_err:
-                        self._send_error_json("upstream_error", str(re_err), http_code=502)
-                        return
-            if gen is None and first_event is None:
+                        _log(f"[Auto-Fallback] Stream retry exception on '{cand}': {re_err}")
+                        break
+            if gen is None or first_event is None:
                 self._send_error_json("upstream_error", str(e), http_code=e.status)
                 return
         except StopIteration:
@@ -1540,7 +1566,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if isinstance(prompt, list):
             prompt = "\n".join(str(p) for p in prompt)
 
-        model = body.get("model") or DEFAULT_MODEL
+        model = body.get("model") or get_default_model()
         stream = bool(body.get("stream", False))
         backend_model, thinking_level = resolve_backend_model(model)
 
@@ -1623,10 +1649,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
             return
 
-        model = body.get("model") or "claude-sonnet-5.5"
+        model = body.get("model") or get_default_model()
         stream = bool(body.get("stream", False))
         system = body.get("system")
         raw_msgs = body.get("messages", [])
+        fallback_chain = self._get_fallback_chain(body)
+
+        # Check if requested model is in cooldown
+        effective_model = model
+        if is_model_in_cooldown(model) and fallback_chain:
+            cand = select_fallback_candidate(fallback_chain)
+            if cand and cand != model:
+                _log(f"[Auto-Fallback] Anthropic model '{model}' is in cooldown. Automatically using healthy fallback model '{cand}'")
+                effective_model = cand
 
         conv_messages = []
         if system:
@@ -1676,9 +1711,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     }
                 })
 
-        backend_model, thinking_level = resolve_backend_model(model)
+        backend_model, thinking_level = resolve_backend_model(effective_model)
         chat_body = {
-            "model": model,
+            "model": effective_model,
             "messages": conv_messages,
             "max_tokens": body.get("max_tokens", 4096),
             "temperature": body.get("temperature"),
@@ -1686,63 +1721,107 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "stream": stream,
         }
 
+        def make_anthropic_envelope(m):
+            b_m, t_l = resolve_backend_model(m)
+            c_b = dict(chat_body)
+            c_b["model"] = m
+            return _build_gemini_request(c_b, b_m, t_l)
+
         try:
-            envelope = _build_gemini_request(chat_body, backend_model, thinking_level)
+            envelope = make_anthropic_envelope(effective_model)
         except Exception as e:
             self._send_error_json("request_error", str(e), http_code=400)
             return
 
         if not stream:
+            gemini_resp = None
+            served_model = effective_model
             try:
                 gemini_resp = call_generate_content(envelope)
-                cand = (gemini_resp.get("candidates") or [{}])[0]
-                parts = (cand.get("content") or {}).get("parts") or []
-                text, tool_calls, _ = _extract_parts(parts)
-
-                content_blocks = []
-                if text:
-                    content_blocks.append({"type": "text", "text": text})
-                for tc in tool_calls:
-                    fn = tc.get("function") or {}
-                    try:
-                        args = json.loads(fn.get("arguments", "{}"))
-                    except Exception:
-                        args = {"raw": fn.get("arguments")}
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tc.get("id"),
-                        "name": fn.get("name"),
-                        "input": args,
-                    })
-
-                usage = _extract_usage(gemini_resp)
-                self._send_json(200, {
-                    "id": f"msg_{uuid.uuid4().hex[:24]}",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": content_blocks,
-                    "model": model,
-                    "stop_reason": "tool_use" if tool_calls else "end_turn",
-                    "stop_sequence": None,
-                    "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]},
-                })
             except UpstreamError as e:
-                self._send_error_json("upstream_error", str(e), http_code=e.status)
+                if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and fallback_chain:
+                    tried = {effective_model, envelope.get("model", "")}
+                    while True:
+                        cand = select_fallback_candidate(fallback_chain)
+                        if not cand or cand in tried:
+                            break
+                        tried.add(cand)
+                        try:
+                            _log(f"[Auto-Fallback] Anthropic upstream 429. Retrying with '{cand}'")
+                            new_env = make_anthropic_envelope(cand)
+                            gemini_resp = call_generate_content(new_env)
+                            served_model = cand
+                            break
+                        except Exception as re_err:
+                            _log(f"[Auto-Fallback] Anthropic retry on '{cand}' failed: {re_err}")
+                if gemini_resp is None:
+                    self._send_error_json("upstream_error", str(e), http_code=e.status)
+                    return
+
+            cand = (gemini_resp.get("candidates") or [{}])[0]
+            parts = (cand.get("content") or {}).get("parts") or []
+            text, tool_calls, _ = _extract_parts(parts)
+
+            content_blocks = []
+            if text:
+                content_blocks.append({"type": "text", "text": text})
+            for tc in tool_calls:
+                fn = tc.get("function") or {}
+                try:
+                    args = json.loads(fn.get("arguments", "{}"))
+                except Exception:
+                    args = {"raw": fn.get("arguments")}
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc.get("id"),
+                    "name": fn.get("name"),
+                    "input": args,
+                })
+
+            usage = _extract_usage(gemini_resp)
+            headers = [("x-litellm-model-id", served_model), ("X-Served-Model", served_model)]
+            self._send_json(200, {
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "type": "message",
+                "role": "assistant",
+                "content": content_blocks,
+                "model": served_model,
+                "stop_reason": "tool_use" if tool_calls else "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]},
+            }, extra_headers=headers)
         else:
             # Anthropic streaming
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
             stream_resp = None
+            served_model = effective_model
             try:
                 stream_resp = stream_generate_content(envelope)
             except UpstreamError as e:
-                self._send_error_json("upstream_error", str(e), http_code=e.status)
-                return
+                if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and fallback_chain:
+                    tried = {effective_model, envelope.get("model", "")}
+                    while True:
+                        cand = select_fallback_candidate(fallback_chain)
+                        if not cand or cand in tried:
+                            break
+                        tried.add(cand)
+                        try:
+                            _log(f"[Auto-Fallback] Anthropic stream 429. Retrying with '{cand}'")
+                            new_env = make_anthropic_envelope(cand)
+                            stream_resp = stream_generate_content(new_env)
+                            served_model = cand
+                            break
+                        except Exception as re_err:
+                            _log(f"[Auto-Fallback] Anthropic stream retry on '{cand}' failed: {re_err}")
+                if stream_resp is None:
+                    self._send_error_json("upstream_error", str(e), http_code=e.status)
+                    return
             except Exception as e:
                 self._send_error_json("upstream_error", str(e), http_code=502)
                 return
 
-            self._send_sse_headers()
+            self._send_sse_headers(served_model=served_model)
             send_event = lambda event_type, data: self._write_sse_event(json.dumps(data), event_type=event_type)
 
             try:
@@ -1762,7 +1841,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "id": msg_id,
                         "type": "message",
                         "role": "assistant",
-                        "model": model,
+                        "model": served_model,
                         "content": [],
                         "stop_reason": None,
                         "stop_sequence": None,
@@ -1937,9 +2016,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         elif "3:2" in size:
             aspect_ratio = "3:2"
 
+        live_models = get_available_models()
+        img_model = next((m for m in live_models if "image" in m.lower()), "image-gen")
         envelope = {
             "project": get_project_id(),
-            "model": "gemini-3.1-flash-image",
+            "model": img_model,
             "request": {
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {
