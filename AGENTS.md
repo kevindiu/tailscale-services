@@ -76,8 +76,11 @@ tailscale-services/
 ├── docker-compose.yml              # Complete stack definition (fixed project name: tailscale-services)
 ├── env.example                     # Environment template (Tailscale auth, exit node, model keys)
 ├── .env                            # Active environment file (ignored by git)
+├── antigravity-proxy/              # Antigravity Universal Proxy subproject
+│   ├── antigravity_proxy.py        # Containerized OpenAI-to-CloudCode SSE bridge script
+│   ├── README.md                   # Human developer guide, endpoints, and standalone usage
+│   └── AGENTS.md                   # AI agent guide, invariants, and protocol specifications
 ├── AdGuardHome.template.yaml       # Pre-configured upstream resolvers, DNSSEC & blocklists
-├── antigravity_proxy.py            # Containerized OpenAI-to-CloudCode SSE bridge script
 ├── AGENTS.md                       # This file (AI developer instructions & invariants)
 ├── README.md                       # Human documentation
 ├── scripts/
@@ -173,5 +176,5 @@ docker compose exec -it hermes hermes config set model.default claude-sonnet-5.5
   - Ensure memory limits, restart policies, and Watchtower labels (`com.centurylinklabs.watchtower.depends-on=tailscale`) are preserved when adding services.
   - Never add host-bound `ports:` mappings. All services must be routed strictly through `network_mode: "service:tailscale"`.
 - **Tailscale DNS Isolation:** Always keep `TS_ACCEPT_DNS=false` on the `tailscale` container to prevent DNS loop deadlocks with AdGuard Home.
-- **Antigravity Model Management:** `antigravity_proxy.py` uses dynamic model discovery (`get_available_models()`) with cached live catalog queries and graceful fallback defaults. When updating fallback defaults or aliases, verify both `antigravity_proxy.py` and `fallback_models` in `data/hermes/plugins/model-providers/antigravity/__init__.py`.
+- **Antigravity Model Management:** `antigravity-proxy/antigravity_proxy.py` uses dynamic model discovery (`get_available_models()`) with cached live catalog queries and graceful fallback defaults. When updating fallback defaults or aliases, verify both `antigravity-proxy/antigravity_proxy.py` and `fallback_models` in `data/hermes/plugins/model-providers/antigravity/__init__.py`.
 - **Handling Secrets:** Never commit `.env` or files under `data/` to git. Never insert real API keys or OAuth secrets into `env.example` or compose fallbacks.

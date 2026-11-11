@@ -144,7 +144,7 @@ services:
     network_mode: "service:tailscale"
     volumes:
       - ./data/antigravity:/home/appuser/.gemini/antigravity-cli:rw
-      - ./antigravity_proxy.py:/app/antigravity_proxy.py:ro
+      - ./antigravity-proxy/antigravity_proxy.py:/app/antigravity_proxy.py:ro
     command: python3 /app/antigravity_proxy.py --host 127.0.0.1 --port 8877
     environment:
       - HOME=/home/appuser
