@@ -517,6 +517,56 @@ def _content_to_text(content) -> str:
     return str(content)
 
 
+def _extract_content_parts(content) -> list[dict]:
+    """Extract text and inlineData parts from OpenAI or Anthropic content."""
+    if not content:
+        return []
+    if isinstance(content, str):
+        return [{"text": content}] if content else []
+    if not isinstance(content, list):
+        return [{"text": str(content)}]
+
+    parts = []
+    text_chunks = []
+
+    for block in content:
+        if not isinstance(block, dict):
+            text_chunks.append(str(block))
+            continue
+        btype = block.get("type", "text")
+        if btype == "text":
+            t = block.get("text", "")
+            if t:
+                text_chunks.append(t)
+        elif btype == "image_url":
+            # OpenAI format
+            iu = block.get("image_url") or {}
+            url = iu.get("url", "") if isinstance(iu, dict) else str(iu or "")
+            if url.startswith("data:") and ";base64," in url:
+                header, b64 = url.split(";base64,", 1)
+                mime = header[5:] if header.startswith("data:") else "image/jpeg"
+                parts.append({"inlineData": {"mimeType": mime, "data": b64.strip()}})
+            elif url:
+                text_chunks.append(f"[image: {url}]")
+        elif btype == "image":
+            # Anthropic format
+            src = block.get("source") or {}
+            b64 = src.get("data", "")
+            mime = src.get("media_type", "image/jpeg")
+            if b64:
+                parts.append({"inlineData": {"mimeType": mime, "data": b64.strip()}})
+        else:
+            t = block.get("text")
+            if t:
+                text_chunks.append(str(t))
+
+    if text_chunks:
+        full_text = "\n".join(c for c in text_chunks if c)
+        if full_text:
+            parts.insert(0, {"text": full_text})
+    return parts
+
+
 def _openai_tools_to_gemini(tools: list) -> list:
     if not tools:
         return []
@@ -665,10 +715,7 @@ def _build_gemini_request(body: dict, backend_model: str) -> dict:
             continue
 
         # Default user role
-        text = _content_to_text(msg.get("content"))
-        parts = []
-        if text:
-            parts.append({"text": text})
+        parts = _extract_content_parts(msg.get("content"))
         for tc in (msg.get("tool_calls") or []):
             if isinstance(tc, dict):
                 fn = tc.get("function") or {}
@@ -1685,11 +1732,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if isinstance(content, list):
                 text_parts = []
                 tool_calls = []
+                content_blocks = []
                 for b in content:
                     if isinstance(b, dict):
                         btype = b.get("type")
                         if btype == "text":
                             text_parts.append(b.get("text", ""))
+                            content_blocks.append(b)
+                        elif btype == "image":
+                            content_blocks.append(b)
                         elif btype == "tool_use":
                             tool_calls.append({
                                 "id": b.get("id"),
@@ -1702,7 +1753,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 "tool_call_id": b.get("tool_use_id"),
                                 "content": _content_to_text(b.get("content")),
                             })
-                msg_dict = {"role": role, "content": "\n".join(text_parts)}
+                has_image = any(isinstance(b, dict) and b.get("type") == "image" for b in content_blocks)
+                msg_dict = {"role": role, "content": content_blocks if has_image else "\n".join(text_parts)}
                 if tool_calls:
                     msg_dict["tool_calls"] = tool_calls
                 conv_messages.append(msg_dict)
