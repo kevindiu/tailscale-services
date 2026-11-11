@@ -48,14 +48,15 @@ This document specifies the architecture, operational contracts, upstream protoc
   - If upstream returns HTTP 429 (`RESOURCE_EXHAUSTED`), the proxy records the exhausted model into cooldown and loops through remaining healthy candidates sequentially (`while True`) until success or chain exhaustion.
   - If **no** fallback chain is supplied by the caller, the proxy must **never** guess or substitute arbitrary fallback models. It must propagate the upstream 429 error directly to the caller.
 
-### Invariant 4: Cooldown State Machine & Upstream Parsing
-- **Strict Rule:** Upstream 429 responses must parse exact reset timestamps to avoid guessing.
+### Invariant 4: Cooldown State Machine & Canonical Key Resolution
+- **Strict Rule:** Upstream 429 responses must parse exact reset timestamps to avoid guessing, and cooldown keys must be canonically resolved.
 - **Parsing Priority:**
   1. ISO timestamp: `quotaResetTimeStamp` (case-insensitive regex).
   2. Float seconds: `retryDelay: 12345.6s` (case-insensitive regex).
   3. Natural language: `resets in Xh Ym Zs` (case-insensitive regex).
   4. Fallback: 3600 seconds (1 hour) only if no reset info is parseable.
-- Cooldown keys are mapped to their canonical backend model representation and automatically expire when `time.time() >= reset_epoch`.
+- **Canonical Matching:** `record_model_cooldown` and `is_model_in_cooldown` must resolve model strings to their canonical backend model (`resolve_backend_model(m)[0]`). This ensures that cooldowns recorded under `claude-opus-5-5-low` are respected when requested as `claude-opus-5.5` or `opus`.
+- Cooldown keys are stored in `_MODEL_COOLDOWNS` under `_MODEL_COOLDOWNS_LOCK` and automatically expire when `time.time() >= reset_epoch`.
 
 ### Invariant 5: In-Memory Token Caching (Zero Disk I/O Hot Path)
 - **Strict Rule:** Do not open, read, or parse `TOKEN_FILE` from disk on every HTTP request.
@@ -69,6 +70,15 @@ This document specifies the architecture, operational contracts, upstream protoc
   - `X-Served-Model: <model_name>`
   - `x-litellm-model-id: <model_name>`
 - This ensures upstream clients (e.g. Hermes Agent turn footers) know precisely which model answered if a fallback occurred.
+
+### Invariant 7: Stream Peeking Before Sending SSE 200 Headers
+- **Strict Rule:** Never emit HTTP 200 SSE headers before verifying the stream generator successfully yields its first event.
+- **Reason:** If an upstream quota exhaustion (429) occurs immediately on stream connect, sending HTTP 200 first commits headers to the client and makes HTTP-level fallback impossible.
+- **Implementation:** Always peek the first event (`first_event = next(gen)` inside a `try/except UpstreamError` block). If 429 occurs, execute multi-hop fallback to find a working candidate before calling `_send_sse_headers()`.
+
+### Invariant 8: Server Daemon Threads & Clean Shutdown
+- **Strict Rule:** Always maintain `server.daemon_threads = True` on `ThreadingHTTPServer`.
+- **Reason:** Worker threads handling long-lived SSE connections or keep-alive sockets will prevent the Python process from terminating cleanly on `SIGTERM` / `docker stop` unless they are daemon threads.
 
 ---
 
@@ -90,9 +100,61 @@ Antigravity proxies to Google Cloud Code Assist internal API:
   - `POST /v1internal:streamGenerateContent?alt=sse` — Streaming SSE completion
   - `POST /v1internal:retrieveUserQuotaSummary` — Account quota buckets and remaining fractions
 
+### Upstream Request Envelope Schema
+When building requests for `generateContent` or `streamGenerateContent`, the JSON body must conform to:
+
+```json
+{
+  "project": "<project_id>",
+  "model": "<canonical_backend_model>",
+  "request": {
+    "contents": [
+      {
+        "role": "user" | "model",
+        "parts": [
+          {"text": "..."} |
+          {"functionCall": {"name": "...", "args": {...}}} |
+          {"functionResponse": {"name": "...", "response": {...}}}
+        ]
+      }
+    ],
+    "generationConfig": {
+      "temperature": 0.7,
+      "maxOutputTokens": 4096,
+      "thinkingConfig": {
+        "thinkingLevel": "high" | "low"
+      }
+    },
+    "tools": [
+      {
+        "functionDeclarations": [
+          {"name": "...", "description": "...", "parameters": {...}}
+        ]
+      }
+    ]
+  },
+  "requestType": "agent",
+  "userAgent": "antigravity",
+  "requestId": "agent-<uuid4>"
+}
+```
+
 ---
 
-## 4. Verification Workflow for Changes
+## 4. Common Pitfalls & Anti-Patterns for AI Agents
+
+1. **DO NOT introduce async event loops (`asyncio` / `aiohttp`):**
+   The server runs on Python's synchronous multi-threaded `ThreadingHTTPServer`. Introducing `async` without a complete rewrite will break the request lifecycle and blocking generators.
+2. **DO NOT read `urllib` streaming response in arbitrary binary blocks:**
+   `StreamResponse(resp)` relies on line-by-line iteration (`resp.readline()`). Reading arbitrary byte blocks (e.g. `resp.read(65536)`) breaks SSE framing and corrupts `data: {...}` JSON boundaries.
+3. **DO NOT mutate `./data/antigravity/` token directory permissions:**
+   The host mounts this volume with strict permissions. Modifying permissions or paths inside the container can break token synchronization with external tools.
+4. **DO NOT ignore `active_cooldowns` when adding monitoring:**
+   Whenever adding health or quota endpoints, keep `active_cooldowns` visible so users and agents can diagnose model availability instantly without inspecting container logs.
+
+---
+
+## 5. Verification Workflow for Changes
 
 After making changes to `antigravity-proxy/antigravity_proxy.py`:
 
