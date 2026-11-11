@@ -120,10 +120,7 @@ When building requests for `generateContent` or `streamGenerateContent`, the JSO
     ],
     "generationConfig": {
       "temperature": 0.7,
-      "maxOutputTokens": 4096,
-      "thinkingConfig": {
-        "thinkingLevel": "high" | "low"
-      }
+      "maxOutputTokens": 4096
     },
     "tools": [
       {

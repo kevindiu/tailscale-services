@@ -331,7 +331,7 @@ def record_model_cooldown(model: str, detail_or_message: str):
 
     # Resolve to canonical backend model so cooldown keys match
     try:
-        canonical_model = resolve_backend_model(model)[0]
+        canonical_model = resolve_backend_model(model)
     except Exception:
         canonical_model = model
 
@@ -384,7 +384,7 @@ def is_model_in_cooldown(model: str) -> bool:
         return False
     keys_to_check = [model]
     try:
-        resolved = resolve_backend_model(model)[0]
+        resolved = resolve_backend_model(model)
         if resolved not in keys_to_check:
             keys_to_check.append(resolved)
     except Exception:
@@ -442,51 +442,49 @@ def select_fallback_candidate(chain: list[str]) -> str | None:
     return None
 
 
-def resolve_backend_model(requested: str) -> tuple[str, str | None]:
-    """Resolve any requested model string to (backend_model_id, thinking_level) dynamically."""
+def resolve_backend_model(requested: str) -> str:
+    """Resolve any requested model string to the canonical live backend model dynamically."""
     live_models = get_available_models()
     if not requested:
-        fallback = get_default_model() or (live_models[0] if live_models else "")
-        return fallback, None
+        return get_default_model() or (live_models[0] if live_models else "")
 
-    effective_requested = requested
+    effective_requested = requested.strip()
 
-    # 1. Exact match
+    # 1. Exact match in live models
     if effective_requested in live_models:
-        thinking = "high" if "high" in effective_requested else ("low" if "low" in effective_requested else None)
-        return effective_requested, thinking
+        return effective_requested
 
-    # 2. Normalized match (e.g. 'claude-sonnet-5.5' -> 'claude-sonnet-5-5')
-    norm = effective_requested.replace(".", "-").lower()
+    def _norm(s: str) -> str:
+        return s.lower().replace(".", "-").replace("_", "-")
 
-    # Common aliases
+    norm = _norm(effective_requested)
+
+    # Common shorthand aliases
     if norm in ("dall-e-3", "dall-e-2", "image", "image-gen"):
         img_model = next((m for m in live_models if "image" in m.lower()), "")
         if img_model:
-            return img_model, None
+            return img_model
     if norm in ("claude-sonnet", "sonnet", "claude-3-5-sonnet", "claude-3-7-sonnet"):
         norm = "claude-sonnet-5-5"
     elif norm in ("claude-opus", "opus"):
         norm = "claude-opus-5-5"
     elif norm in ("gemini-flash", "flash"):
-        norm = "gemini-3.8-flash"
+        norm = "gemini-3-8-flash"
     elif norm in ("gemini-pro", "pro"):
-        norm = "gemini-2.5-pro"
+        norm = "gemini-2-5-pro"
 
-    cands = [m for m in live_models if m.lower() == norm or m.lower().startswith(f"{norm}-") or norm in m.lower()]
-    if cands:
-        preferred = (
-            [c for c in cands if "-medium" in c] or
-            [c for c in cands if "-low" in c] or
-            [c for c in cands if "-high" in c] or
-            cands
-        )
-        chosen = preferred[0]
-        thinking = "high" if "-high" in chosen else ("low" if "-low" in chosen else None)
-        return chosen, thinking
+    # Match against live models
+    for filter_fn in (
+        lambda m: _norm(m) == norm,
+        lambda m: _norm(m).startswith(f"{norm}-"),
+        lambda m: norm in _norm(m),
+    ):
+        cands = [m for m in live_models if filter_fn(m)]
+        if cands:
+            return cands[0]
 
     # Default fallback
-    return requested, None
+    return requested
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -550,7 +548,7 @@ def _tool_choice_to_gemini(tool_choice) -> str | None:
     return None
 
 
-def _build_gemini_request(body: dict, backend_model: str, thinking_level: str | None = None) -> dict:
+def _build_gemini_request(body: dict, backend_model: str) -> dict:
     messages = body.get("messages", [])
     if not isinstance(messages, list):
         messages = []
@@ -709,8 +707,6 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str | 
         gen_config["maxOutputTokens"] = int(body["max_tokens"])
     elif body.get("max_completion_tokens") is not None:
         gen_config["maxOutputTokens"] = int(body["max_completion_tokens"])
-    if thinking_level:
-        gen_config["thinkingConfig"] = {"thinkingLevel": thinking_level, "includeThoughts": False}
     if gen_config:
         inner["generationConfig"] = gen_config
 
@@ -741,12 +737,8 @@ _GEMINI_PASSTHROUGH_RE = re.compile(
 
 
 def _build_passthrough_envelope(model: str, gemini_body: dict) -> dict:
-    backend_model, thinking_level = resolve_backend_model(model)
+    backend_model = resolve_backend_model(model)
     inner = dict(gemini_body)
-
-    if thinking_level and "generationConfig" in inner:
-        tc = inner["generationConfig"].setdefault("thinkingConfig", {})
-        tc.setdefault("thinkingLevel", thinking_level)
 
     if "safetySettings" not in inner:
         inner["safetySettings"] = [
@@ -1196,7 +1188,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_model_detail(self, model_id: str):
         now = int(time.time())
-        backend, _ = resolve_backend_model(model_id)
+        backend = resolve_backend_model(model_id)
         self._send_json(200, {
             "id": model_id,
             "object": "model",
@@ -1310,14 +1302,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 _log(f"[Auto-Fallback] '{openai_model}' is in cooldown. Automatically using healthy fallback model '{cand}'")
                 effective_model = cand
 
-        backend_model, thinking_level = resolve_backend_model(effective_model)
+        backend_model = resolve_backend_model(effective_model)
 
-        def make_envelope(m, th):
-            b_m, t_l = resolve_backend_model(m)
-            return _build_gemini_request(body, b_m, t_l)
+        def make_envelope(m, _=None):
+            b_m = resolve_backend_model(m)
+            return _build_gemini_request(body, b_m)
 
         try:
-            envelope = make_envelope(effective_model, thinking_level)
+            envelope = make_envelope(effective_model)
         except Exception as e:
             self._send_error_json("request_error", f"Failed to build request: {e}", http_code=400)
             return
@@ -1581,7 +1573,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         model = body.get("model") or get_default_model()
         stream = bool(body.get("stream", False))
-        backend_model, thinking_level = resolve_backend_model(model)
+        backend_model = resolve_backend_model(model)
 
         chat_body = {
             "model": model,
@@ -1592,7 +1584,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         }
 
         try:
-            envelope = _build_gemini_request(chat_body, backend_model, thinking_level)
+            envelope = _build_gemini_request(chat_body, backend_model)
         except Exception as e:
             self._send_error_json("request_error", str(e), http_code=400)
             return
@@ -1725,7 +1717,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     }
                 })
 
-        backend_model, thinking_level = resolve_backend_model(effective_model)
+        backend_model = resolve_backend_model(effective_model)
         chat_body = {
             "model": effective_model,
             "messages": conv_messages,
@@ -1736,10 +1728,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         }
 
         def make_anthropic_envelope(m):
-            b_m, t_l = resolve_backend_model(m)
+            b_m = resolve_backend_model(m)
             c_b = dict(chat_body)
             c_b["model"] = m
-            return _build_gemini_request(c_b, b_m, t_l)
+            return _build_gemini_request(c_b, b_m)
 
         try:
             envelope = make_anthropic_envelope(effective_model)
