@@ -86,6 +86,8 @@ def get_default_model() -> str:
         if cand:
             return cand
     return live[0]
+
+
 UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh 2 mins before expiry
 MAX_PAYLOAD_SIZE = 20 * 1024 * 1024  # 20MB
@@ -816,6 +818,8 @@ def _approx_token_count(text: str) -> int:
         return 0
     # ~4 characters per token heuristic
     return max(1, (len(text) + 3) // 4)
+
+
 def _extract_usage(response: dict) -> dict:
     usage = response.get("usageMetadata") or {}
     if not usage:
@@ -992,12 +996,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
         self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Expose-Headers", "X-Served-Model, x-litellm-model-id, Content-Length, Content-Type")
         self.send_header("Access-Control-Max-Age", "86400")
 
+    def send_response(self, code, message=None):
+        self._status_code = code
+        super().send_response(code, message)
+
     def do_OPTIONS(self):
+        t0 = time.time()
         self.send_response(204)
         self._send_cors_headers()
         self.end_headers()
+        self._log_req("OPTIONS", self.path, time.time() - t0)
 
     def _send_sse_headers(self, served_model: str | None = None):
         self.send_response(200)
@@ -1126,11 +1137,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         try:
             return json.loads(raw)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._send_error_json("invalid_request", f"Malformed JSON request: {e}", http_code=400)
             return None
 
-    def _log_req(self, method, path, status, duration):
-        _log(f"{method} {path} {status} {duration:.3f}s")
+    def _log_req(self, method, path, duration):
+        code = getattr(self, "_status_code", 200)
+        _log(f"{method} {path} {code} {duration:.3f}s")
 
     # ── GET Routes ────────────────────────────────────────────────────────────
 
@@ -1161,7 +1174,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _log(f"GET {path} error: {e}")
             self._send_error_json("internal_error", str(e), http_code=500)
         finally:
-            self._log_req("GET", path, 200, time.time() - t0)
+            self._log_req("GET", path, time.time() - t0)
 
     def _handle_models_openai(self):
         now = int(time.time())
@@ -1252,7 +1265,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 self._send_error_json("internal_error", err_msg, http_code=500)
         finally:
-            self._log_req("POST", path, 200, time.time() - t0)
+            self._log_req("POST", path, time.time() - t0)
 
     # ── OpenAI Chat Completions Handler ───────────────────────────────────────
 
@@ -1590,6 +1603,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 cand = (gemini_resp.get("candidates") or [{}])[0]
                 parts = (cand.get("content") or {}).get("parts") or []
                 text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+                headers = [("x-litellm-model-id", model), ("X-Served-Model", model)]
                 self._send_json(200, {
                     "id": f"cmpl-{uuid.uuid4().hex[:24]}",
                     "object": "text_completion",
@@ -1597,7 +1611,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "model": model,
                     "choices": [{"text": text, "index": 0, "logprobs": None, "finish_reason": "stop"}],
                     "usage": _extract_usage(gemini_resp),
-                })
+                }, extra_headers=headers)
             except UpstreamError as e:
                 self._send_error_json("upstream_error", str(e), http_code=e.status)
         else:
@@ -1614,7 +1628,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._send_error_json("upstream_error", str(e), http_code=502)
                 return
 
-            self._send_sse_headers()
+            self._send_sse_headers(served_model=model)
             try:
                 for event in stream_resp:
                     if not isinstance(event, dict) or event.get("__done__"):
@@ -2079,7 +2093,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if action == "generateContent":
             try:
                 gemini_resp = call_generate_content(envelope)
-                self._send_json(200, gemini_resp)
+                headers = [("x-litellm-model-id", model), ("X-Served-Model", model)]
+                self._send_json(200, gemini_resp, extra_headers=headers)
             except UpstreamError as e:
                 self._send_error_json("upstream_error", str(e), http_code=e.status)
         else:
@@ -2094,7 +2109,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._send_error_json("upstream_error", str(e), http_code=502)
                 return
 
-            self._send_sse_headers()
+            self._send_sse_headers(served_model=model)
 
             try:
                 for event in stream_resp:
@@ -2124,7 +2139,6 @@ def main():
     args = parser.parse_args()
 
     _log("Starting Antigravity Universal Proxy...")
-    _read_token_from_disk()
     get_access_token()
     get_project_id()
 
