@@ -379,31 +379,6 @@ def record_model_cooldown(model: str, detail_or_message: str):
         _log(f"[Cooldown] Recorded cooldown for '{canonical_model}' until {datetime.fromtimestamp(reset_epoch, tz=timezone.utc).isoformat()}")
 
 
-def is_model_in_cooldown(model: str) -> bool:
-    if not model:
-        return False
-    keys_to_check = [model]
-    try:
-        resolved = resolve_backend_model(model)
-        if resolved not in keys_to_check:
-            keys_to_check.append(resolved)
-    except Exception:
-        pass
-
-    now = time.time()
-    with _MODEL_COOLDOWNS_LOCK:
-        in_cooldown = False
-        for key in keys_to_check:
-            until = _MODEL_COOLDOWNS.get(key)
-            if until is not None:
-                if now >= until:
-                    del _MODEL_COOLDOWNS[key]
-                    _log(f"[Cooldown] Cooldown expired for '{key}', restored to service")
-                else:
-                    in_cooldown = True
-        return in_cooldown
-
-
 def get_active_cooldowns() -> dict[str, dict[str, Any]]:
     """Return dictionary of currently active model cooldowns with seconds remaining."""
     now = time.time()
@@ -424,69 +399,9 @@ def get_active_cooldowns() -> dict[str, dict[str, Any]]:
     return active
 
 
-def get_auto_fallback_model(requested_model: str) -> str | None:
-    """Return requested_model if not in cooldown, else None."""
-    if not is_model_in_cooldown(requested_model):
-        return requested_model
-    return None
-
-
-def select_fallback_candidate(chain: list[str]) -> str | None:
-    """Find the first healthy model in the specified fallback chain."""
-    for m in chain:
-        m_clean = m.strip()
-        if not m_clean:
-            continue
-        if not is_model_in_cooldown(m_clean):
-            return m_clean
-    return None
-
-
 def resolve_backend_model(requested: str) -> str:
-    """Resolve any requested model string to the canonical live backend model dynamically."""
-    live_models = get_available_models()
-    if not requested:
-        return get_default_model() or (live_models[0] if live_models else "")
-
-    effective_requested = requested.strip()
-
-    # 1. Exact match in live models
-    if effective_requested in live_models:
-        return effective_requested
-
-    def _norm(s: str) -> str:
-        return s.lower().replace(".", "-").replace("_", "-")
-
-    norm = _norm(effective_requested)
-
-    # Common shorthand aliases
-    if norm in ("dall-e-3", "dall-e-2", "image", "image-gen"):
-        img_model = next((m for m in live_models if "image" in m.lower()), "")
-        if img_model:
-            return img_model
-    if norm in ("claude-sonnet", "sonnet", "claude-3-5-sonnet", "claude-3-7-sonnet"):
-        norm = "claude-sonnet-5-5"
-    elif norm in ("claude-opus", "opus"):
-        norm = "claude-opus-5-5"
-    elif norm in ("gemini-flash", "flash"):
-        norm = "gemini-3-8-flash"
-    elif norm in ("gemini-pro", "pro"):
-        norm = "gemini-2-5-pro"
-
-    # Match against live models
-    for filter_fn in (
-        lambda m: _norm(m) == norm,
-        lambda m: _norm(m).startswith(f"{norm}-"),
-        lambda m: norm in _norm(m),
-    ):
-        cands = [m for m in live_models if filter_fn(m)]
-        if cands:
-            # Prefer candidate that is not currently in cooldown
-            healthy_cands = [c for c in cands if not is_model_in_cooldown(c)]
-            return healthy_cands[0] if healthy_cands else cands[0]
-
-    # Default fallback
-    return requested
+    """Return requested model directly as-is without any alias or fuzzy mapping."""
+    return (requested or "").strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1311,24 +1226,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── OpenAI Chat Completions Handler ───────────────────────────────────────
 
-    def _get_fallback_chain(self, body: dict) -> list[str]:
-        """Extract fallback chain from headers or body if explicitly requested.
-        Supports:
-          - Header 'X-Fallback-Chain': 'gemini-4-argon-low, gemini-3.8-flash-medium'
-          - Header 'X-Fallback-Models': '...'
-          - Body 'fallback_chain': ['model1', 'model2']
-        """
-        raw_header = self.headers.get("X-Fallback-Chain") or self.headers.get("X-Fallback-Models")
-        if raw_header:
-            return [m.strip() for m in raw_header.split(",") if m.strip()]
-        if isinstance(body, dict) and "fallback_chain" in body:
-            fb = body.get("fallback_chain")
-            if isinstance(fb, list):
-                return [str(m).strip() for m in fb if str(m).strip()]
-            if isinstance(fb, str):
-                return [m.strip() for m in fb.split(",") if m.strip()]
-        return []
-
     def _handle_chat(self):
         body = self._read_body()
         if body is None:
@@ -1643,15 +1540,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream", False))
         system = body.get("system")
         raw_msgs = body.get("messages", [])
-        fallback_chain = self._get_fallback_chain(body)
-
-        # Check if requested model is in cooldown
-        effective_model = model
-        if is_model_in_cooldown(model) and fallback_chain:
-            cand = select_fallback_candidate(fallback_chain)
-            if cand and cand != model:
-                _log(f"[Auto-Fallback] Anthropic model '{model}' is in cooldown. Automatically using healthy fallback model '{cand}'")
-                effective_model = cand
 
         conv_messages = []
         if system:
@@ -1706,9 +1594,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     }
                 })
 
-        backend_model = resolve_backend_model(effective_model)
+        backend_model = resolve_backend_model(model)
         chat_body = {
-            "model": effective_model,
+            "model": model,
             "messages": conv_messages,
             "max_tokens": body.get("max_tokens", 4096),
             "temperature": body.get("temperature"),
@@ -1716,42 +1604,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "stream": stream,
         }
 
-        def make_anthropic_envelope(m):
-            b_m = resolve_backend_model(m)
-            c_b = dict(chat_body)
-            c_b["model"] = m
-            return _build_gemini_request(c_b, b_m)
-
         try:
-            envelope = make_anthropic_envelope(effective_model)
+            envelope = _build_gemini_request(chat_body, backend_model)
         except Exception as e:
             self._send_error_json("request_error", str(e), http_code=400)
             return
 
         if not stream:
             gemini_resp = None
-            served_model = effective_model
+            served_model = model
             try:
                 gemini_resp = call_generate_content(envelope)
             except UpstreamError as e:
-                if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and fallback_chain:
-                    tried = {effective_model, envelope.get("model", "")}
-                    while True:
-                        cand = select_fallback_candidate(fallback_chain)
-                        if not cand or cand in tried:
-                            break
-                        tried.add(cand)
-                        try:
-                            _log(f"[Auto-Fallback] Anthropic upstream 429. Retrying with '{cand}'")
-                            new_env = make_anthropic_envelope(cand)
-                            gemini_resp = call_generate_content(new_env)
-                            served_model = cand
-                            break
-                        except Exception as re_err:
-                            _log(f"[Auto-Fallback] Anthropic retry on '{cand}' failed: {re_err}")
-                if gemini_resp is None:
-                    self._send_error_json("upstream_error", str(e), http_code=e.status)
-                    return
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+                return
 
             cand = (gemini_resp.get("candidates") or [{}])[0]
             parts = (cand.get("content") or {}).get("parts") or []
@@ -1789,31 +1655,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
             stream_resp = None
-            served_model = effective_model
+            served_model = model
             try:
                 stream_resp = stream_generate_content(envelope)
             except UpstreamError as e:
-                if (e.status == 429 or "RESOURCE_EXHAUSTED" in str(e)) and fallback_chain:
-                    tried = {effective_model, envelope.get("model", "")}
-                    while True:
-                        cand = select_fallback_candidate(fallback_chain)
-                        if not cand or cand in tried:
-                            break
-                        tried.add(cand)
-                        try:
-                            _log(f"[Auto-Fallback] Anthropic stream 429. Retrying with '{cand}'")
-                            new_env = make_anthropic_envelope(cand)
-                            stream_resp = stream_generate_content(new_env)
-                            served_model = cand
-                            break
-                        except Exception as re_err:
-                            if stream_resp:
-                                stream_resp.close()
-                                stream_resp = None
-                            _log(f"[Auto-Fallback] Anthropic stream retry on '{cand}' failed: {re_err}")
-                if stream_resp is None:
-                    self._send_error_json("upstream_error", str(e), http_code=e.status)
-                    return
+                self._send_error_json("upstream_error", str(e), http_code=e.status)
+                return
             except Exception as e:
                 if stream_resp:
                     stream_resp.close()
