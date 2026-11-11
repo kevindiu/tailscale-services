@@ -79,13 +79,7 @@ def get_default_model() -> str:
     if DEFAULT_MODEL:
         return DEFAULT_MODEL
     live = get_available_models()
-    if not live:
-        return ""
-    for pref in ("flash", "sonnet", "chat"):
-        cand = next((m for m in live if pref in m.lower() and not m.startswith("tab_") and not m.startswith("chat_")), None)
-        if cand:
-            return cand
-    return live[0]
+    return live[0] if live else ""
 
 
 UPSTREAM_TIMEOUT = 300  # 5 minutes
@@ -316,92 +310,6 @@ def get_available_models() -> list[str]:
                 return _cached_models
 
         return _cached_models or []
-
-
-# Model Cooldown & Fallback Chain Cache
-# model_name -> expiration timestamp (monotonic or unix)
-_MODEL_COOLDOWNS: dict[str, float] = {}
-_MODEL_COOLDOWNS_LOCK = threading.Lock()
-
-
-def record_model_cooldown(model: str, detail_or_message: str):
-    """Record an upstream 429 quota exhaustion for a model and calculate its reset timestamp."""
-    if not model:
-        return
-
-    # Resolve to canonical backend model so cooldown keys match
-    try:
-        canonical_model = resolve_backend_model(model)
-    except Exception:
-        canonical_model = model
-
-    reset_epoch = None
-    # 1. Parse quotaResetTimeStamp: 2026-11-14T01:13:20Z (case-insensitive)
-    m_ts = re.search(r"['\"]?quotaResetTimeStamp['\"]?\s*:\s*['\"]?([0-9T:\-Z\.]+)['\"]?", detail_or_message, re.IGNORECASE)
-    if m_ts:
-        try:
-            ts_str = m_ts.group(1).rstrip("Z") + "+00:00"
-            target_dt = datetime.fromisoformat(ts_str)
-            reset_epoch = target_dt.timestamp()
-        except Exception:
-            pass
-
-    # 2. Parse retryDelay: 310370.5s (case-insensitive)
-    if reset_epoch is None:
-        m_delay = re.search(r"['\"]?retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s?['\"]?", detail_or_message, re.IGNORECASE)
-        if m_delay:
-            try:
-                reset_epoch = time.time() + float(m_delay.group(1))
-            except Exception:
-                pass
-
-    # 3. Parse natural language reset: "resets in 1h 2m 3s" / "reset in 5m" / etc.
-    if reset_epoch is None:
-        m_nl = re.search(
-            r"resets?\s+in\s+(?:(\d+(?:\.\d+)?)\s*h)?\s*(?:(\d+(?:\.\d+)?)\s*m)?\s*(?:(\d+(?:\.\d+)?)\s*s)?",
-            detail_or_message,
-            re.IGNORECASE,
-        )
-        if m_nl and any(m_nl.groups()):
-            hours = float(m_nl.group(1) or 0)
-            minutes = float(m_nl.group(2) or 0)
-            seconds = float(m_nl.group(3) or 0)
-            total_seconds = hours * 3600 + minutes * 60 + seconds
-            if total_seconds > 0:
-                reset_epoch = time.time() + total_seconds
-
-    # 4. Default fallback: 1 hour if not specified
-    if reset_epoch is None:
-        reset_epoch = time.time() + 3600
-
-    with _MODEL_COOLDOWNS_LOCK:
-        _MODEL_COOLDOWNS[canonical_model] = reset_epoch
-        _log(f"[Cooldown] Recorded cooldown for '{canonical_model}' until {datetime.fromtimestamp(reset_epoch, tz=timezone.utc).isoformat()}")
-
-
-def get_active_cooldowns() -> dict[str, dict[str, Any]]:
-    """Return dictionary of currently active model cooldowns with seconds remaining."""
-    now = time.time()
-    active = {}
-    with _MODEL_COOLDOWNS_LOCK:
-        expired = []
-        for model, until in _MODEL_COOLDOWNS.items():
-            rem = until - now
-            if rem <= 0:
-                expired.append(model)
-            else:
-                active[model] = {
-                    "resets_in_seconds": round(rem, 1),
-                    "reset_at": datetime.fromtimestamp(until, tz=timezone.utc).isoformat(),
-                }
-        for model in expired:
-            del _MODEL_COOLDOWNS[model]
-    return active
-
-
-def resolve_backend_model(requested: str) -> str:
-    """Return requested model directly as-is without any alias or fuzzy mapping."""
-    return (requested or "").strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -701,7 +609,7 @@ _GEMINI_PASSTHROUGH_RE = re.compile(
 
 
 def _build_passthrough_envelope(model: str, gemini_body: dict) -> dict:
-    backend_model = resolve_backend_model(model)
+    backend_model = (model or "").strip()
     inner = dict(gemini_body)
 
     if "safetySettings" not in inner:
@@ -864,7 +772,7 @@ def call_generate_content(envelope: dict) -> dict:
         except Exception:
             pass
         if e.code == 429 or "RESOURCE_EXHAUSTED" in detail:
-            record_model_cooldown(envelope.get("model", ""), detail)
+            pass
         raise UpstreamError(f"Upstream HTTP {e.code}: {detail}", status=e.code, body=detail)
     except Exception as e:
         raise UpstreamError(f"Upstream network error: {e}", status=502)
@@ -917,7 +825,7 @@ def stream_generate_content(envelope: dict):
         except Exception:
             pass
         if e.code == 429 or "RESOURCE_EXHAUSTED" in detail:
-            record_model_cooldown(envelope.get("model", ""), detail)
+            pass
         raise UpstreamError(f"Upstream stream HTTP {e.code}: {detail}", status=e.code, body=detail)
     except Exception as e:
         raise UpstreamError(f"Upstream stream network error: {e}", status=502)
@@ -1111,7 +1019,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "version": "2.2.0",
                     "project_id": get_project_id(),
                     "default_model": get_default_model(),
-                    "active_cooldowns": get_active_cooldowns(),
                 })
             elif path in ("/v1/models", "/models"):
                 self._handle_models_openai()
@@ -1132,28 +1039,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _handle_models_openai(self):
         now = int(time.time())
         live_models = get_available_models()
-        data = []
-        seen = set()
-
-        # Add all exact live backend models and dynamic aliases
-        for m in live_models:
-            if m not in seen:
-                data.append({"id": m, "object": "model", "created": now, "owned_by": "google"})
-                seen.add(m)
-            dot_alias = re.sub(r"-(\d+)-(\d+)", r"-\1.\2", m)
-            if dot_alias != m and dot_alias not in seen:
-                data.append({"id": dot_alias, "object": "model", "created": now, "owned_by": "google"})
-                seen.add(dot_alias)
-            base_alias = re.sub(r"-(low|medium|high|tiered)$", "", dot_alias)
-            if base_alias != dot_alias and base_alias not in seen:
-                data.append({"id": base_alias, "object": "model", "created": now, "owned_by": "google"})
-                seen.add(base_alias)
-
+        data = [
+            {"id": m, "object": "model", "created": now, "owned_by": "google"}
+            for m in live_models
+        ]
         self._send_json(200, {"object": "list", "data": data})
 
     def _handle_model_detail(self, model_id: str):
         now = int(time.time())
-        backend = resolve_backend_model(model_id)
+        backend = (model_id or "").strip()
         self._send_json(200, {
             "id": model_id,
             "object": "model",
@@ -1183,7 +1077,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "status": "ok",
                 "project_id": get_project_id(),
-                "active_cooldowns": get_active_cooldowns(),
                 "quota": quota,
             })
         except Exception as e:
@@ -1203,10 +1096,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._handle_anthropic_messages()
             elif path in ("/v1/images/generations", "/images/generations"):
                 self._handle_images()
-            elif path in ("/v1/cooldown/clear", "/cooldown/clear"):
-                with _MODEL_COOLDOWNS_LOCK:
-                    _MODEL_COOLDOWNS.clear()
-                self._send_json(200, {"status": "ok", "message": "All model cooldowns cleared"})
             elif _GEMINI_PASSTHROUGH_RE.match(path):
                 self._handle_gemini_passthrough(path)
             else:
@@ -1234,13 +1123,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error_json("invalid_request", "Body must be JSON object", http_code=400)
             return
 
-        openai_model = body.get("model") or get_default_model()
+        openai_model = (body.get("model") or get_default_model()).strip()
         stream = bool(body.get("stream", False))
 
-        backend_model = resolve_backend_model(openai_model)
-
         try:
-            envelope = _build_gemini_request(body, backend_model)
+            envelope = _build_gemini_request(body, openai_model)
         except Exception as e:
             self._send_error_json("request_error", f"Failed to build request: {e}", http_code=400)
             return
@@ -1453,9 +1340,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if isinstance(prompt, list):
             prompt = "\n".join(str(p) for p in prompt)
 
-        model = body.get("model") or get_default_model()
+        model = (body.get("model") or get_default_model()).strip()
         stream = bool(body.get("stream", False))
-        backend_model = resolve_backend_model(model)
 
         chat_body = {
             "model": model,
@@ -1466,7 +1352,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         }
 
         try:
-            envelope = _build_gemini_request(chat_body, backend_model)
+            envelope = _build_gemini_request(chat_body, model)
         except Exception as e:
             self._send_error_json("request_error", str(e), http_code=400)
             return
@@ -1594,7 +1480,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     }
                 })
 
-        backend_model = resolve_backend_model(model)
         chat_body = {
             "model": model,
             "messages": conv_messages,
@@ -1605,7 +1490,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         }
 
         try:
-            envelope = _build_gemini_request(chat_body, backend_model)
+            envelope = _build_gemini_request(chat_body, model)
         except Exception as e:
             self._send_error_json("request_error", str(e), http_code=400)
             return
