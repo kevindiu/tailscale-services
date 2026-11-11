@@ -481,7 +481,9 @@ def resolve_backend_model(requested: str) -> str:
     ):
         cands = [m for m in live_models if filter_fn(m)]
         if cands:
-            return cands[0]
+            # Prefer candidate that is not currently in cooldown
+            healthy_cands = [c for c in cands if not is_model_in_cooldown(c)]
+            return healthy_cands[0] if healthy_cands else cands[0]
 
     # Default fallback
     return requested
@@ -1174,7 +1176,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         data = []
         seen = set()
 
-        # Add all exact live backend models and dynamic dot-formatted aliases
+        # Add all exact live backend models and dynamic aliases
         for m in live_models:
             if m not in seen:
                 data.append({"id": m, "object": "model", "created": now, "owned_by": "google"})
@@ -1183,6 +1185,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if dot_alias != m and dot_alias not in seen:
                 data.append({"id": dot_alias, "object": "model", "created": now, "owned_by": "google"})
                 seen.add(dot_alias)
+            base_alias = re.sub(r"-(low|medium|high|tiered)$", "", dot_alias)
+            if base_alias != dot_alias and base_alias not in seen:
+                data.append({"id": base_alias, "object": "model", "created": now, "owned_by": "google"})
+                seen.add(base_alias)
 
         self._send_json(200, {"object": "list", "data": data})
 

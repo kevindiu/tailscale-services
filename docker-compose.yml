@@ -151,6 +151,7 @@ services:
       - ANTIGRAVITY_TOKEN_FILE=/home/appuser/.gemini/antigravity-cli/antigravity-oauth-token
       - ANTIGRAVITY_CLIENT_ID=${ANTIGRAVITY_CLIENT_ID}
       - ANTIGRAVITY_CLIENT_SECRET=${ANTIGRAVITY_CLIENT_SECRET}
+      - ANTIGRAVITY_DEFAULT_MODEL=${ANTIGRAVITY_DEFAULT_MODEL:-}
     security_opt:
       - no-new-privileges:true
     cap_drop:
