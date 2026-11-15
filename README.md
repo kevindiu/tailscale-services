@@ -231,22 +231,21 @@ Because `TS_EXTRA_ARGS=--advertise-exit-node` is enabled by default, this node i
 
 ---
 
-## Maintenance & Automatic Updates
+## Maintenance & Updates
 
-### Automatic Updates (cron + Compose)
-There is no updater container. `scripts/update-stack.sh` pulls new images and recreates the stack **through Compose**, which is the only safe way to update `tailscale`: every dependent service joins its network namespace by container ID, so recreating it outside Compose leaves them on a dead namespace.
-
-Install it as a daily job on the host (04:00):
+### Updating Images (Manual)
+No updater container and no scheduler are installed — updates are deliberate:
 ```bash
-crontab -l | { cat; echo "0 4 * * * cd $(pwd) && ./scripts/update-stack.sh"; } | crontab -
+./scripts/update-stack.sh
 ```
+The script pulls new images and recreates through Compose, which is the only safe way to update `tailscale`: every dependent service joins its network namespace by container ID, so recreating it outside Compose leaves them on a dead namespace.
 
 What it does:
 - `docker compose pull` — nothing is recreated when no image changed.
 - `tailscale` image changed → `up -d --force-recreate --wait`, so `tailscale` is rebuilt first and every dependent re-attaches to the new namespace.
 - Otherwise → `up -d --wait`, recreating only services whose image changed; if the health check fails it retries with a full recreate.
 - `docker image prune -f` — drops dangling layers.
-- Output appends to `data/update.log` (rotated at 1 MB).
+- Prints to stdout; add `| tee -a data/update.log` if you want a record.
 
 ### Manual Updates (On-Demand)
 ```bash

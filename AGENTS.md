@@ -118,12 +118,8 @@ docker compose down
 docker compose up -d --force-recreate hermes
 ```
 
-### Updating Images (Automatic)
-`scripts/update-stack.sh` is the only supported updater. It pulls, recreates through Compose (dependency order), waits for health, and prunes dangling images. Install it on the host as a daily cron job:
-```bash
-crontab -l | { cat; echo "0 4 * * * cd $(pwd) && ./scripts/update-stack.sh"; } | crontab -
-```
-Logs append to `data/update.log` (rotated at 1 MB).
+### Updating Images (Manual)
+`scripts/update-stack.sh` is the only supported updater. It pulls, recreates through Compose (dependency order), waits for health, and prunes dangling images. There is no scheduler and no updater container; run it by hand.
 
 ### Checking Service Health & Logs
 ```bash

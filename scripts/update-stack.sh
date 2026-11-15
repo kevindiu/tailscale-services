@@ -11,13 +11,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-LOG_FILE="${PROJECT_DIR}/data/update.log"
-mkdir -p "${PROJECT_DIR}/data"
-if [[ -f "$LOG_FILE" && $(wc -c <"$LOG_FILE") -gt 1048576 ]]; then
-  mv -f "$LOG_FILE" "${LOG_FILE}.1"
-fi
-exec >>"$LOG_FILE" 2>&1
-
 echo "===== $(date -Is) update start ====="
 
 old_tailscale=""
