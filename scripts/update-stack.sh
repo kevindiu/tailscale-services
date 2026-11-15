@@ -11,25 +11,35 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+UP_ARGS=(--remove-orphans --wait --wait-timeout 300)
+
 echo "===== $(date -Is) update start ====="
 
-old_tailscale=""
+old_container=""
+old_image=""
 if docker inspect tailscale >/dev/null 2>&1; then
-  old_tailscale=$(docker inspect -f '{{.Image}}' tailscale)
+  old_container=$(docker inspect -f '{{.Id}}' tailscale)
+  old_image=$(docker inspect -f '{{.Image}}' tailscale)
 fi
 
 docker compose pull --quiet
 
-new_tailscale=$(docker image inspect -f '{{.Id}}' \
+new_image=$(docker image inspect -f '{{.Id}}' \
   "$(docker compose config --images | grep -m1 'tailscale/tailscale')")
 
-if [[ -n "$old_tailscale" && "$old_tailscale" != "$new_tailscale" ]]; then
+if [[ -n "$old_image" && "$old_image" != "$new_image" ]]; then
   echo "tailscale image changed -> recreating the whole stack"
-  docker compose up -d --force-recreate --wait --wait-timeout 300
-elif ! docker compose up -d --wait --wait-timeout 300; then
-  # Safety net: a config change can also force tailscale to be recreated.
-  echo "health check failed -> forcing a full recreate"
-  docker compose up -d --force-recreate --wait --wait-timeout 300
+  docker compose up -d --force-recreate "${UP_ARGS[@]}"
+else
+  docker compose up -d "${UP_ARGS[@]}"
+  # A config change (not an image change) can still force tailscale to be
+  # recreated. Dependents then hold a dead netns, yet their loopback
+  # healthchecks keep passing, so detect it explicitly and rebuild them.
+  new_container=$(docker inspect -f '{{.Id}}' tailscale 2>/dev/null || true)
+  if [[ -n "$old_container" && "$old_container" != "$new_container" ]]; then
+    echo "tailscale was recreated -> rebuilding dependents"
+    docker compose up -d --force-recreate "${UP_ARGS[@]}"
+  fi
 fi
 
 docker image prune -f

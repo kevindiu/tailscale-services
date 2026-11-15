@@ -4,6 +4,11 @@
 # To restore:
 # 1. Copy this file to data/adguard/conf/AdGuardHome.yaml
 # 2. Add your admin user or run the setup wizard.
+#
+# schema_version below was captured from a specific AdGuard Home release.
+# AdGuard migrates older schemas upward automatically, but refuses a template
+# newer than the running binary — if the container won't start after a restore,
+# delete schema_version and let AdGuard rebuild the file.
 
 http:
   pprof:
@@ -19,7 +24,9 @@ http:
   address: 0.0.0.0:80
   session_ttl: 30d
 
-# Credentials sanitized: add your user here or create one on initial setup
+# Credentials sanitized: add your user here or create one on initial setup.
+# WARNING: with `users: []` the first client on the tailnet to reach port 80
+# can claim the admin account. Set a user immediately after restoring this file.
 # Example:
 # users:
 #   - name: admin
@@ -87,8 +94,12 @@ dns:
   upstream_timeout: 10s
   private_networks:
     - 100.64.0.0/10
-  use_private_ptr_resolvers: false
-  local_ptr_upstreams: []
+  use_private_ptr_resolvers: true
+  # MagicDNS answers PTR for 100.64/10. Safe at startup because AdGuard only
+  # starts after tailscale reports healthy; queries stall only while tailscaled
+  # is down (upstream_timeout bounds them).
+  local_ptr_upstreams:
+    - 100.100.100.100
   use_dns64: false
   dns64_prefixes: []
   serve_http3: false

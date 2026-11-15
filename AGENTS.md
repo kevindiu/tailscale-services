@@ -11,7 +11,7 @@ This file documents the architecture, operational workflows, and security invari
 1. **`tailscale`**: The network namespace owner. Establishes the encrypted WireGuard tunnel, registers the MagicDNS hostname (`tailscale-services`), and acts as a network exit node.
 2. **`adguardhome`**: High-performance, ad-blocking recursive DNS server. Resolves upstream DNS via encrypted DoH/DoT (Quad9, Cloudflare) with DNSSEC validation.
 3. **`rustdesk-hbbs` & `rustdesk-hbbr`**: Self-hosted RustDesk rendezvous server and relay server with public key authentication (`-k _`).
-4. **`hermes`**: Autonomous AI agent by Nous Research (`nousresearch/hermes-agent`). Supports messaging platforms (Telegram, Discord, Slack) and an OpenAI-compatible API server on port 8642.
+4. **`hermes`**: Autonomous AI agent by Nous Research (`nousresearch/hermes-agent`). Runs messaging platforms (Telegram, Discord, Slack) and the web dashboard; the OpenAI-compatible API server (port 8642) is opt-in via `API_SERVER_ENABLED` + `API_SERVER_KEY`.
 
 There is no updater container. Images are refreshed by `scripts/update-stack.sh` from the host (see §5).
 
@@ -24,8 +24,8 @@ There is no updater container. Images are refreshed by `scripts/update-stack.sh`
 |                                         Docker Host                                       |
 |                                                                                           |
 |  +-------------------------------------------------------------------------------------+  |
-|  |                          Tailscale Container (Network Owner)                         |  |
-|  |    Hostname: tailscale-services | Tagless (Key Expiry disabled via admin console)    |  |
+|  |                         Tailscale Container (Network Owner)                         |  |
+|  |   Hostname: tailscale-services | Tagless (Key Expiry disabled via admin console)    |  |
 |  |    Capabilities: ALL dropped, only NET_ADMIN + NET_RAW added                        |  |
 |  |    Exit Node: Enabled by default (--advertise-exit-node)                            |  |
 |  +-------------------------------------------+-----------------------------------------+  |
@@ -36,7 +36,7 @@ There is no updater container. Images are refreshed by `scripts/update-stack.sh`
 |  |   AdGuard Home    |  |  RustDesk Server   |  |      Hermes Agent       |             |
 |  |  Port 53 (DNS)    |  |  hbbs: 21115-21116 |  |  Port 9119 (Web UI)     |             |
 |  |  Port 3000 / 80   |  |  hbbr: 21117       |  |  Telegram Gateway       |             |
-|  |  (Web Dashboard)  |  |  Auth: Public Key  |  |  API Server: 8642       |             |
+|  |  (Web Dashboard)  |  |  Auth: Public Key  |  |  Memory Cap: 2GB        |             |
 |  +-------------------+  +--------------------+  +-------------------------+             |
 +-------------------------------------------------------------------------------------------+
                                                   ^
@@ -119,7 +119,7 @@ docker compose up -d --force-recreate hermes
 ```
 
 ### Updating Images (Manual)
-`scripts/update-stack.sh` is the only supported updater. It pulls, recreates through Compose (dependency order), waits for health, and prunes dangling images. There is no scheduler and no updater container; run it by hand.
+`scripts/update-stack.sh` is the only supported updater. It pulls, recreates through Compose (dependency order), waits for health, and prunes dangling images. It also detects a tailscale **recreate** caused by a config change and rebuilds the dependents, whose loopback healthchecks would otherwise keep passing on a dead namespace. There is no scheduler and no updater container; run it by hand.
 
 ### Checking Service Health & Logs
 ```bash
@@ -170,7 +170,8 @@ docker compose exec -it hermes hermes config set model.default <provider>/<model
   - Always keep `name: tailscale-services` at the root.
   - Every service must attach the `x-logging: &default-logging` anchor (`<<: *default-logging`) to prevent unbounded disk usage.
   - Sub-services must keep `depends_on: tailscale: { condition: service_healthy }`. Do not add shell-based healthchecks to `rustdesk` as its minimalist container image lacks utilities like `pgrep` or `curl`.
-  - Ensure memory limits and restart policies are preserved when adding services.
+  - Ensure memory limits, restart policies, `pids_limit`, and `TZ=${TZ:-Asia/Tokyo}` are preserved when adding services.
+  - Services that write state on shutdown need `stop_grace_period` (Hermes uses 30s for SQLite).
   - Never add host-bound `ports:` mappings. All services must be routed strictly through `network_mode: "service:tailscale"`.
   - The only permitted mapping is `41641:41641/udp` on `tailscale` (fixed WireGuard port; removing it reintroduces iOS reconnection drops).
 - **Healthchecks Must Be Real:** Never add catch-all fallbacks such as `|| test -e /proc/net/tcp` — they report healthy while the service is broken. Probe the actual service (`nc -z 127.0.0.1 53` for AdGuard, `GET /api/health` for Hermes).

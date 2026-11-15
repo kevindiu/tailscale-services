@@ -3,3 +3,14 @@
 
 # Persistent data directories
 data/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs and local backups
+*.log
+*.log.*
+*.bak

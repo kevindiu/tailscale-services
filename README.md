@@ -24,7 +24,7 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 |  |           AdGuard Home            |  |    RustDesk Server    |  | Hermes AI Agent |  |
 |  |  Port 53 (DNS - open to Tailnet)  |  |  hbbs: 21115, 21116   |  | Port 9119 (Web) |  |
 |  |  Port 3000 / 80 (Admin ACL)       |  |  hbbr: 21117 (Relay)  |  | Telegram Gateway|  |
-|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | OpenAI API 8642 |  |
+|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | Dashboard: 9119 |  |
 |  |  DNSSEC: Enabled                  |  |  Memory Cap: 256MB    |  | Memory Cap: 2GB |  |
 |  |  Memory Cap: 512MB                |  |                       |  |                 |  |
 |  +-----------------------------------+  +-----------------------+  +-----------------+  |
@@ -79,7 +79,9 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
    TAILSCALE_HOSTNAME=tailscale-services
    TS_EXTRA_ARGS=--advertise-exit-node
    RUSTDESK_RELAY_HOST=tailscale-services
+   HERMES_DASHBOARD_PASSWORD=change-me-to-a-long-random-password
    ```
+   `HERMES_DASHBOARD_PASSWORD` is mandatory — the stack refuses to start without it.
 3. Start the containers (initialize data directories first):
    ```bash
    ./scripts/init-volumes.sh
@@ -99,6 +101,8 @@ To prevent Tailscale from disconnecting after 180 days:
 1. Go to **[Tailscale Admin → Machines](https://login.tailscale.com/admin/machines)**.
 2. Find **`tailscale-services`**.
 3. Click the three dots `...` → **Disable key expiry**.
+
+> **Note on `TS_AUTH_ONCE`:** the container only consumes `TS_AUTHKEY` on first boot. If you remove the node in the admin console or let the key expire, it will **not** re-register by itself — stop the stack, delete `data/tailscale/tailscaled.state`, and start it again.
 
 ---
 
@@ -169,10 +173,10 @@ On any RustDesk client connected to your Tailnet:
 
 ---
 
-### Step 7: Hermes AI Agent (Zero Mac Processes)
+### Step 7: Hermes AI Agent (Zero Host Processes)
 
 **Hermes** runs as an isolated container inside the shared Tailscale network namespace:
-- **100% Containerized:** No processes, terminal sessions, or Python scripts run on your Mac.
+- **100% Containerized:** No processes, terminal sessions, or Python scripts run on the host.
 - **Auto-Started:** When you run `docker compose up -d`, everything starts together automatically.
 
 #### Web UI / Dashboard
@@ -191,6 +195,10 @@ Features included in the Web UI:
 ```bash
 docker compose exec -it hermes hermes chat
 ```
+
+> **Data directory permissions:** `./data/hermes` is `700` and owned by UID `10000` after the container's first boot (the entrypoint remaps and chowns it). Reading it from the host therefore needs `sudo`; that is intentional, it holds `.env`, `auth.json` and `state.db`.
+
+> **OpenAI-compatible API server is off by default.** To expose `/v1` on port 8642, set `API_SERVER_ENABLED=true` and a strong `API_SERVER_KEY` in `data/hermes/.env` (the server refuses to start without a key), and add the env vars to the `hermes` service.
 
 #### Switching Models
 List the models available to your configured providers, then set the default:
@@ -229,8 +237,6 @@ Because `TS_EXTRA_ARGS=--advertise-exit-node` is enabled by default, this node i
 
 ---
 
----
-
 ## Maintenance & Updates
 
 ### Updating Images (Manual)
@@ -244,13 +250,12 @@ What it does:
 - `docker compose pull` — nothing is recreated when no image changed.
 - `tailscale` image changed → `up -d --force-recreate --wait`, so `tailscale` is rebuilt first and every dependent re-attaches to the new namespace.
 - Otherwise → `up -d --wait`, recreating only services whose image changed; if the health check fails it retries with a full recreate.
-- `docker image prune -f` — drops dangling layers.
+- Detects a tailscale **recreate** caused by a config change (not an image change) and rebuilds the dependents, whose loopback healthchecks would otherwise keep passing on a dead namespace.
+- `--remove-orphans` cleans up containers for services removed from the compose file.
+- `docker image prune -f` — drops dangling layers (no rollback to the previous image).
 - Prints to stdout; add `| tee -a data/update.log` if you want a record.
 
-### Manual Updates (On-Demand)
-```bash
-./scripts/update-stack.sh
-```
+> **Version pinning:** every image is tagged `latest`, so a pull is not reproducible and `docker image prune` removes the previous image (no rollback). If you need deterministic deploys, pin digests (`image: repo@sha256:…`) and update them deliberately.
 
 ### Inspecting Logs
 ```bash
@@ -259,7 +264,6 @@ docker compose logs -f adguardhome
 docker compose logs -f rustdesk-hbbs
 docker compose logs -f rustdesk-hbbr
 docker compose logs -f hermes
-tail -f data/update.log
 ```
 
 ### Restoring Pre-Configured Settings
