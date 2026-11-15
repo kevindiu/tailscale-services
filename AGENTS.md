@@ -13,7 +13,7 @@ This file documents the architecture, operational workflows, and security invari
 3. **`rustdesk-hbbs` & `rustdesk-hbbr`**: Self-hosted RustDesk rendezvous server and relay server with public key authentication (`-k _`).
 4. **`hermes`**: Autonomous AI agent by Nous Research (`nousresearch/hermes-agent`). Runs messaging platforms (Telegram, Discord, Slack) and the web dashboard; the OpenAI-compatible API server (port 8642) is opt-in via `API_SERVER_ENABLED` + `API_SERVER_KEY`.
 
-There is no updater container. Images are refreshed by `scripts/update-stack.sh` from the host (see §5).
+There is no updater container. Images are refreshed manually with `docker compose pull && docker compose up -d` from the host (see §5).
 
 ---
 
@@ -59,7 +59,7 @@ There is no updater container. Images are refreshed by `scripts/update-stack.sh`
    - Dependent services (`adguardhome`, `rustdesk-hbbs`, `rustdesk-hbbr`, `hermes`) must retain `network_mode: "service:tailscale"`.
 3. **Docker Socket Isolation:**
    - No container may mount `/var/run/docker.sock`.
-   - Updates run from the host via `scripts/update-stack.sh`; never add a container that needs daemon access.
+   - Updates run from the host with `docker compose pull && docker compose up -d`; never add a container that needs daemon access.
 4. **Zero Host Mac Processes:**
    - Hermes runs 100% inside Docker via the `hermes` container.
    - Do not instruct the user to run host-level Python scripts or use `host.docker.internal`.
@@ -68,7 +68,7 @@ There is no updater container. Images are refreshed by `scripts/update-stack.sh`
    - All containers have explicit memory caps in `docker-compose.yml` to prevent host exhaustion.
 6. **Updates Must Go Through Compose:**
    - Every dependent service joins `tailscale`'s network namespace by container ID. Recreating `tailscale` outside Compose (Watchtower, `docker rm`, a bare `docker run`) leaves the dependents on a dead namespace.
-   - Update with `scripts/update-stack.sh` only: it pulls, then recreates through `docker compose up`, which rebuilds `tailscale` first and the dependents after it.
+   - Update with `docker compose pull && docker compose up -d --remove-orphans` only: `up` rebuilds `tailscale` first and the dependents after it.
 
 ---
 
@@ -83,8 +83,7 @@ tailscale-services/
 ├── AGENTS.md                       # This file (AI developer instructions & invariants)
 ├── README.md                       # Human documentation
 ├── scripts/
-│   ├── init-volumes.sh             # Sets up ./data directories with strict 700 permissions
-│   └── update-stack.sh             # Pulls new images and recreates the stack via Compose
+│   └── init-volumes.sh             # Sets up ./data directories with strict 700 permissions
 └── data/                           # Persistent state directory (ignored by git)
     ├── adguard/                    # AdGuard configuration and query logs
     │   ├── conf/AdGuardHome.yaml
@@ -119,7 +118,12 @@ docker compose up -d --force-recreate hermes
 ```
 
 ### Updating Images (Manual)
-`scripts/update-stack.sh` is the only supported updater. It pulls, recreates through Compose (dependency order), waits for health, and prunes dangling images. It also detects a tailscale **recreate** caused by a config change and rebuilds the dependents, whose loopback healthchecks would otherwise keep passing on a dead namespace. There is no scheduler and no updater container; run it by hand.
+There is no scheduler and no updater container. From the host:
+```bash
+docker compose pull
+docker compose up -d --remove-orphans --wait --wait-timeout 300
+```
+`up` rebuilds `tailscale` first, then re-attaches the dependents, which is mandatory because they bind to its network namespace by container ID. If a config change recreates `tailscale` without an image change, check `docker compose ps` — the dependents' loopback healthchecks keep passing even on a dead namespace, so recreate them if their container IDs did not change.
 
 ### Checking Service Health & Logs
 ```bash

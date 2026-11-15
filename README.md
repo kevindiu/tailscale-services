@@ -242,20 +242,16 @@ Because `TS_EXTRA_ARGS=--advertise-exit-node` is enabled by default, this node i
 ### Updating Images (Manual)
 No updater container and no scheduler are installed — updates are deliberate:
 ```bash
-./scripts/update-stack.sh
+docker compose pull
+docker compose up -d --remove-orphans --wait --wait-timeout 300
 ```
-The script pulls new images and recreates through Compose, which is the only safe way to update `tailscale`: every dependent service joins its network namespace by container ID, so recreating it outside Compose leaves them on a dead namespace.
+Always update through Compose: every dependent service joins `tailscale`'s network namespace by container ID, so recreating `tailscale` with `docker rm`, `docker run` or Watchtower leaves the dependents on a dead namespace. `up` rebuilds `tailscale` first and re-attaches the dependents.
 
-What it does:
-- `docker compose pull` — nothing is recreated when no image changed.
-- `tailscale` image changed → `up -d --force-recreate --wait`, so `tailscale` is rebuilt first and every dependent re-attaches to the new namespace.
-- Otherwise → `up -d --wait`, recreating only services whose image changed; if the health check fails it retries with a full recreate.
-- Detects a tailscale **recreate** caused by a config change (not an image change) and rebuilds the dependents, whose loopback healthchecks would otherwise keep passing on a dead namespace.
-- `--remove-orphans` cleans up containers for services removed from the compose file.
-- `docker image prune -f` — drops dangling layers (no rollback to the previous image).
-- Prints to stdout; add `| tee -a data/update.log` if you want a record.
+A **config** change can also recreate `tailscale` without an image change. Afterwards confirm with `docker compose ps` that the dependents were rebuilt — their healthchecks are loopback-based and keep passing even on a dead namespace.
 
-> **Version pinning:** every image is tagged `latest`, so a pull is not reproducible and `docker image prune` removes the previous image (no rollback). If you need deterministic deploys, pin digests (`image: repo@sha256:…`) and update them deliberately.
+Optionally `docker image prune -f` to drop the old layers (there is no rollback afterwards).
+
+> **Version pinning:** every image is tagged `latest`, so a pull is not reproducible. If you need deterministic deploys, pin digests (`image: repo@sha256:…`) and update them deliberately.
 
 ### Inspecting Logs
 ```bash
