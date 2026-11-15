@@ -140,45 +140,6 @@ services:
       tailscale:
         condition: service_healthy
 
-  # Antigravity OpenAI Bridge
-  # Runs entirely inside Docker — zero processes on your Mac, zero connection to host Mac
-  antigravity-proxy:
-    <<: *default-logging
-    image: python:3.11-alpine
-    container_name: antigravity-proxy
-    restart: unless-stopped
-    user: "10000:10000"
-    network_mode: "service:tailscale"
-    volumes:
-      - ./data/antigravity:/home/appuser/.gemini/antigravity-cli:rw
-      - ./antigravity-proxy/antigravity_proxy.py:/app/antigravity_proxy.py:ro
-    command: python3 /app/antigravity_proxy.py --host 127.0.0.1 --port 8877
-    environment:
-      - HOME=/home/appuser
-      - ANTIGRAVITY_TOKEN_FILE=/home/appuser/.gemini/antigravity-cli/antigravity-oauth-token
-      - ANTIGRAVITY_CLIENT_ID=${ANTIGRAVITY_CLIENT_ID}
-      - ANTIGRAVITY_CLIENT_SECRET=${ANTIGRAVITY_CLIENT_SECRET}
-      - ANTIGRAVITY_DEFAULT_MODEL=${ANTIGRAVITY_DEFAULT_MODEL:-}
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8877/health', timeout=3)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    labels:
-      - "com.centurylinklabs.watchtower.depends-on=tailscale"
-    depends_on:
-      tailscale:
-        condition: service_healthy
-
   # Hermes AI Agent (Autonomous Agent & Gateway)
   hermes:
     <<: *default-logging

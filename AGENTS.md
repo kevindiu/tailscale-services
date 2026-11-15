@@ -12,33 +12,32 @@ This file documents the architecture, operational workflows, and security invari
 2. **`adguardhome`**: High-performance, ad-blocking recursive DNS server. Resolves upstream DNS via encrypted DoH/DoT (Quad9, Cloudflare) with DNSSEC validation.
 3. **`rustdesk-hbbs` & `rustdesk-hbbr`**: Self-hosted RustDesk rendezvous server and relay server with public key authentication (`-k _`).
 4. **`hermes`**: Autonomous AI agent by Nous Research (`nousresearch/hermes-agent`). Supports messaging platforms (Telegram, Discord, Slack) and an OpenAI-compatible API server on port 8642.
-5. **`antigravity-proxy`**: Ultra-lightweight containerized Python bridge (`python:3.11-alpine`) connecting Hermes directly to Google Cloud Code Assist / Antigravity models (Gemini 3.8 Flash, Claude Sonnet 5.5, Claude Opus 5.5).
-6. **`watchtower`**: Daily automated updater (checks at 04:00 AM UTC) to pull newer Docker images without downtime.
+5. **`watchtower`**: Daily automated updater (checks at 04:00 AM UTC) to pull newer Docker images without downtime.
 
 ---
 
 ## 2. Architecture & Networking
 
 ```
-+---------------------------------------------------------------------------------------------------+
-|                                            Docker Host                                            |
-|                                                                                                   |
-|  +---------------------------------------------------------------------------------------------+  |
-|  |                             Tailscale Container (Network Owner)                             |  |
-|  |    Hostname: tailscale-services | Tagless (Key Expiry disabled via admin console)           |  |
-|  |    Capabilities: ALL dropped, only NET_ADMIN + NET_RAW added                                |  |
-|  |    Exit Node: Enabled by default (--advertise-exit-node)                                    |  |
-|  +----------------------------------------------+----------------------------------------------+  |
-|                                                 | network_mode: "service:tailscale"               |
-|            +------------------+-----------------+------------------+-----------------+            |
-|            |                  |                                    |                 |            |
-|  +---------v---------+  +-----v--------------+  +------------------v--+  +-----------v---------+  |
-|  |   AdGuard Home    |  |  RustDesk Server   |  |   Hermes Agent      |  |  Antigravity Bridge |  |
-|  |  Port 53 (DNS)    |  |  hbbs: 21115-21116 |  |  Port 9119 (Web UI) |  |  Port 8877 (Loopback)|  |
-|  |  Port 3000 / 80   |  |  hbbr: 21117       |  |  Telegram Gateway   |  |  Google OAuth Token |  |
-|  |  (Web Dashboard)  |  |  Auth: Public Key  |  |  Plugin: antigravity|  |  No Mac processes   |  |
-|  +-------------------+  +--------------------+  +---------------------+  +---------------------+  |
-+---------------------------------------------------------------------------------------------------+
++-------------------------------------------------------------------------------------------+
+|                                         Docker Host                                       |
+|                                                                                           |
+|  +-------------------------------------------------------------------------------------+  |
+|  |                          Tailscale Container (Network Owner)                         |  |
+|  |    Hostname: tailscale-services | Tagless (Key Expiry disabled via admin console)    |  |
+|  |    Capabilities: ALL dropped, only NET_ADMIN + NET_RAW added                        |  |
+|  |    Exit Node: Enabled by default (--advertise-exit-node)                            |  |
+|  +-------------------------------------------+-----------------------------------------+  |
+|                                              | network_mode: "service:tailscale"          |
+|             +------------------+-------------+------------------+                        |
+|             |                  |                                |                        |
+|  +----------v--------+  +------v-------------+  +---------------v---------+             |
+|  |   AdGuard Home    |  |  RustDesk Server   |  |      Hermes Agent       |             |
+|  |  Port 53 (DNS)    |  |  hbbs: 21115-21116 |  |  Port 9119 (Web UI)     |             |
+|  |  Port 3000 / 80   |  |  hbbr: 21117       |  |  Telegram Gateway       |             |
+|  |  (Web Dashboard)  |  |  Auth: Public Key  |  |  API Server: 8642       |             |
+|  +-------------------+  +--------------------+  +-------------------------+             |
++-------------------------------------------------------------------------------------------+
                                                   ^
                                                   | Private WireGuard Mesh
                                                   v
@@ -55,13 +54,12 @@ This file documents the architecture, operational workflows, and security invari
    - **Never** add host port mappings (`ports:`) to `docker-compose.yml`.
    - All inbound traffic must travel exclusively through the encrypted Tailscale network namespace.
 2. **Network Sharing:**
-   - Dependent services (`adguardhome`, `rustdesk-hbbs`, `rustdesk-hbbr`, `hermes`, `antigravity-proxy`) must retain `network_mode: "service:tailscale"`.
+   - Dependent services (`adguardhome`, `rustdesk-hbbs`, `rustdesk-hbbr`, `hermes`) must retain `network_mode: "service:tailscale"`.
 3. **Docker Socket Isolation:**
    - `watchtower` is the **only** container permitted to mount `/var/run/docker.sock`.
-   - Never mount `/var/run/docker.sock` to `hermes` or `antigravity-proxy`.
+   - Never mount `/var/run/docker.sock` to `hermes`.
 4. **Zero Host Mac Processes:**
-   - The Antigravity bridge runs 100% inside Docker via the `antigravity-proxy` container.
-   - Hermes communicates with the bridge over local container loopback (`http://127.0.0.1:8877/v1`).
+   - Hermes runs 100% inside Docker via the `hermes` container.
    - Do not instruct the user to run host-level Python scripts or use `host.docker.internal`.
 5. **Least Privilege & Resource Limits:**
    - Tailscale runs with `cap_drop: ALL` and only `NET_ADMIN` + `NET_RAW`.
@@ -76,10 +74,6 @@ tailscale-services/
 ├── docker-compose.yml              # Complete stack definition (fixed project name: tailscale-services)
 ├── env.example                     # Environment template (Tailscale auth, exit node, model keys)
 ├── .env                            # Active environment file (ignored by git)
-├── antigravity-proxy/              # Antigravity Universal Proxy subproject
-│   ├── antigravity_proxy.py        # Containerized OpenAI-to-CloudCode SSE bridge script
-│   ├── README.md                   # Human developer guide, endpoints, and standalone usage
-│   └── AGENTS.md                   # AI agent guide, invariants, and protocol specifications
 ├── AdGuardHome.template.yaml       # Pre-configured upstream resolvers, DNSSEC & blocklists
 ├── AGENTS.md                       # This file (AI developer instructions & invariants)
 ├── README.md                       # Human documentation
@@ -94,17 +88,12 @@ tailscale-services/
     │   └── id_ed25519.pub
     ├── tailscale/                  # Tailscaled state file
     │   └── tailscaled.state
-    ├── antigravity/                # Google OAuth token for Cloud Code Assist API
-    │   └── antigravity-oauth-token
     └── hermes/                     # Hermes persistent state, skills, memories, configs
         ├── config.yaml
         ├── .env
         ├── auth.json
         ├── SOUL.md
-        ├── state.db
-        └── plugins/model-providers/antigravity/
-            ├── plugin.yaml
-            └── __init__.py
+        └── state.db
 ```
 
 ---
@@ -133,7 +122,6 @@ docker compose logs -f
 docker compose logs -f tailscale
 docker compose logs -f adguardhome
 docker compose logs -f hermes
-docker compose logs -f antigravity-proxy
 ```
 
 ### Restoring Pre-Configured AdGuard Home
@@ -161,8 +149,8 @@ docker compose exec -it hermes hermes setup
 # Run diagnostic health check
 docker compose exec hermes hermes doctor
 
-# Switch default model (gemini-3.8-flash, claude-sonnet-5.5, claude-opus-5.5)
-docker compose exec -it hermes hermes config set model.default claude-sonnet-5.5
+# Switch default model (list available models first with: hermes model)
+docker compose exec -it hermes hermes config set model.default <provider>/<model>
 ```
 
 ---
@@ -176,5 +164,4 @@ docker compose exec -it hermes hermes config set model.default claude-sonnet-5.5
   - Ensure memory limits, restart policies, and Watchtower labels (`com.centurylinklabs.watchtower.depends-on=tailscale`) are preserved when adding services.
   - Never add host-bound `ports:` mappings. All services must be routed strictly through `network_mode: "service:tailscale"`.
 - **Tailscale DNS Isolation:** Always keep `TS_ACCEPT_DNS=false` on the `tailscale` container to prevent DNS loop deadlocks with AdGuard Home.
-- **Antigravity Model Management:** `antigravity-proxy/antigravity_proxy.py` uses dynamic model discovery (`get_available_models()`) with cached live catalog queries and graceful fallback defaults. When updating fallback defaults or aliases, verify both `antigravity-proxy/antigravity_proxy.py` and `fallback_models` in `data/hermes/plugins/model-providers/antigravity/__init__.py`.
 - **Handling Secrets:** Never commit `.env` or files under `data/` to git. Never insert real API keys or OAuth secrets into `env.example` or compose fallbacks.

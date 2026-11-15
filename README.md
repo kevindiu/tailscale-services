@@ -21,10 +21,10 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 |                    +-----------------------+-----------------------+                    |
 |                    |                       |                       |                    |
 |  +-----------------v-----------------+  +--v--------------------+  +--v--------------+  |
-|  |           AdGuard Home            |  |    RustDesk Server    |  | Hermes + Proxy  |  |
-|  |  Port 53 (DNS - open to Tailnet)  |  |  hbbs: 21115, 21116   |  | Port 9119 (Web)|  |
-|  |  Port 3000 / 80 (Admin ACL)       |  |  hbbr: 21117 (Relay)  |  | Zero Mac Procs  |  |
-|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | Pure Container  |  |
+|  |           AdGuard Home            |  |    RustDesk Server    |  | Hermes AI Agent |  |
+|  |  Port 53 (DNS - open to Tailnet)  |  |  hbbs: 21115, 21116   |  | Port 9119 (Web) |  |
+|  |  Port 3000 / 80 (Admin ACL)       |  |  hbbr: 21117 (Relay)  |  | Telegram Gateway|  |
+|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | OpenAI API 8642 |  |
 |  |  DNSSEC: Enabled                  |  |  Memory Cap: 256MB    |  | Memory Cap: 2GB |  |
 |  |  Memory Cap: 512MB                |  |                       |  |                 |  |
 |  +-----------------------------------+  +-----------------------+  +-----------------+  |
@@ -42,11 +42,10 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 - **No WAN / Open Resolver risk:** No application service ports (DNS, Web, RustDesk, Agent) are mapped to the host interface. AdGuard Home is physically unreachable by the public internet or external port scanners.
 - **Fixed WireGuard UDP Port (iOS / Mobile Drop Mitigation):** Maps `41641:41641/udp` directly to Tailscale. This prevents Docker from assigning ephemeral, shifting outbound ports upon container restart, eliminating the "silent blackhole" connection drops on iOS/iPadOS clients.
 - **Tailscale ACL isolation:** Devices on your Tailnet can send DNS queries to port `53`, but only designated admin devices can reach the AdGuard dashboard, RustDesk ports, or Hermes Agent API.
-- **Isolated Container Boundary (Hermes AI Agent & Antigravity):**
-  - **Zero Host Processes:** Both Hermes and the Antigravity bridge run 100% inside Docker. No scripts or services run on your Mac.
-  - **Zero Host Connections:** Hermes communicates with the Antigravity bridge via local container loopback (`127.0.0.1:8877`), completely avoiding `host.docker.internal` or Mac network adapters.
-  - **Scoped Host Mount:** Hermes state is stored under `./data/hermes`, and Antigravity tokens are in `./data/antigravity`.
-  - **Zero Docker Socket Access:** `/var/run/docker.sock` is NOT mounted into Hermes or the proxy, strictly preventing container escapes or host filesystem mounts.
+- **Isolated Container Boundary (Hermes AI Agent):**
+  - **Zero Host Processes:** Hermes runs 100% inside Docker. No scripts or services run on your Mac.
+  - **Scoped Host Mount:** Hermes state is stored under `./data/hermes`.
+  - **Zero Docker Socket Access:** `/var/run/docker.sock` is NOT mounted into Hermes, strictly preventing container escapes or host filesystem mounts.
   - **Least Privilege:** Runs with `no-new-privileges:true`, unprivileged UID/GID (10000), and memory limits enforced.
 - **Zero Tagging Hassle:** No complex ACL tag configurations required. Simply click "Disable key expiry" in the Tailscale admin console for permanent, uninterrupted uptime.
 - **Built-in Exit Node:** Advertised by default (`TS_EXTRA_ARGS=--advertise-exit-node`), allowing you to use this node as a secure full VPN when traveling or on public Wi-Fi.
@@ -170,11 +169,10 @@ On any RustDesk client connected to your Tailnet:
 
 ---
 
-### Step 7: Hermes AI Agent & Antigravity (Zero Mac Processes)
+### Step 7: Hermes AI Agent (Zero Mac Processes)
 
-**Hermes** runs alongside an ultra-lightweight containerized bridge (`antigravity-proxy`) that connects directly to Google Cloud Code Assist:
+**Hermes** runs as an isolated container inside the shared Tailscale network namespace:
 - **100% Containerized:** No processes, terminal sessions, or Python scripts run on your Mac.
-- **Internal Loopback:** Hermes talks to the Antigravity bridge over `http://127.0.0.1:8877/v1` inside the shared Tailscale network namespace.
 - **Auto-Started:** When you run `docker compose up -d`, everything starts together automatically.
 
 #### Web UI / Dashboard
@@ -194,35 +192,12 @@ Features included in the Web UI:
 docker compose exec -it hermes hermes chat
 ```
 
-#### Available Antigravity Models
-Your account has access to the latest Gemini, Claude, and GPT-OSS models via Antigravity:
-- `gemini-3.8-flash` (Default)
-- `claude-sonnet-5.5`
-- `claude-opus-5.5`
-- `gemini-4-argon`
-- `gpt-oss-120b`
-
-To switch models in Hermes:
+#### Switching Models
+List the models available to your configured providers, then set the default:
 ```bash
-docker compose exec -it hermes hermes config set model.default claude-sonnet-5.5
+docker compose exec -it hermes hermes model
+docker compose exec -it hermes hermes config set model.default <provider>/<model>
 ```
-
-#### Supported Endpoints in Antigravity Bridge
-The bridge dynamically discovers all 31+ models available to your Google account with **zero hardcoding** and exposes full multi-protocol support:
-
-| Protocol | Endpoint | Description |
-| :--- | :--- | :--- |
-| **OpenAI Chat** | `POST /v1/chat/completions` | Streaming & non-streaming chat with function/tool calling |
-| **OpenAI Text** | `POST /v1/completions` | Legacy completions (code completion / FIM) |
-| **Anthropic** | `POST /v1/messages` | Full Claude Messages API (Claude Code, Continue.dev, Zed) |
-| **OpenAI Images**| `POST /v1/images/generations`| Image generation via `gemini-3.1-flash-image` |
-| **Gemini Native**| `POST /v1beta/models/{model}:generateContent` | Direct Gemini JSON & image passthrough |
-| **Gemini Stream**| `POST /v1beta/models/{model}:streamGenerateContent` | Direct Gemini streaming passthrough |
-| **Models List** | `GET /v1/models` & `GET /v1beta/models` | Dynamic live model discovery from Google |
-| **Model Info** | `GET /v1/models/{model}` | Model metadata and backend mapping |
-| **Quota & Usage**| `GET /v1/usage` | Real-time weekly and 5-hour limit remaining |
-| **Health** | `GET /health` | Bridge status and connected Google Cloud project |
-| **CORS** | `OPTIONS /*` | Full CORS preflight support for web frontends |
 
 ---
 
