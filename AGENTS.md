@@ -12,7 +12,8 @@ This file documents the architecture, operational workflows, and security invari
 2. **`adguardhome`**: High-performance, ad-blocking recursive DNS server. Resolves upstream DNS via encrypted DoH/DoT (Quad9, Cloudflare) with DNSSEC validation.
 3. **`rustdesk-hbbs` & `rustdesk-hbbr`**: Self-hosted RustDesk rendezvous server and relay server with public key authentication (`-k _`).
 4. **`hermes`**: Autonomous AI agent by Nous Research (`nousresearch/hermes-agent`). Supports messaging platforms (Telegram, Discord, Slack) and an OpenAI-compatible API server on port 8642.
-5. **`watchtower`**: Daily automated updater (checks at 04:00 AM UTC) to pull newer Docker images without downtime.
+
+There is no updater container. Images are refreshed by `scripts/update-stack.sh` from the host (see §5).
 
 ---
 
@@ -57,17 +58,17 @@ This file documents the architecture, operational workflows, and security invari
 2. **Network Sharing:**
    - Dependent services (`adguardhome`, `rustdesk-hbbs`, `rustdesk-hbbr`, `hermes`) must retain `network_mode: "service:tailscale"`.
 3. **Docker Socket Isolation:**
-   - `watchtower` is the **only** container permitted to mount `/var/run/docker.sock`.
-   - Never mount `/var/run/docker.sock` to `hermes`.
+   - No container may mount `/var/run/docker.sock`.
+   - Updates run from the host via `scripts/update-stack.sh`; never add a container that needs daemon access.
 4. **Zero Host Mac Processes:**
    - Hermes runs 100% inside Docker via the `hermes` container.
    - Do not instruct the user to run host-level Python scripts or use `host.docker.internal`.
 5. **Least Privilege & Resource Limits:**
    - Tailscale runs with `cap_drop: ALL` and only `NET_ADMIN` + `NET_RAW`.
    - All containers have explicit memory caps in `docker-compose.yml` to prevent host exhaustion.
-6. **Watchtower Must Never Recreate `tailscale`:**
-   - Keep `com.centurylinklabs.watchtower.enable=false` on the `tailscale` service. Recreating it orphans every `network_mode: service:tailscale` container (they hold a stale netns reference).
-   - Tailscale is updated manually: `docker compose pull tailscale && docker compose up -d`.
+6. **Updates Must Go Through Compose:**
+   - Every dependent service joins `tailscale`'s network namespace by container ID. Recreating `tailscale` outside Compose (Watchtower, `docker rm`, a bare `docker run`) leaves the dependents on a dead namespace.
+   - Update with `scripts/update-stack.sh` only: it pulls, then recreates through `docker compose up`, which rebuilds `tailscale` first and the dependents after it.
 
 ---
 
@@ -82,7 +83,8 @@ tailscale-services/
 ├── AGENTS.md                       # This file (AI developer instructions & invariants)
 ├── README.md                       # Human documentation
 ├── scripts/
-│   └── init-volumes.sh             # Sets up ./data directories with strict 700/755 permissions
+│   ├── init-volumes.sh             # Sets up ./data directories with strict 700 permissions
+│   └── update-stack.sh             # Pulls new images and recreates the stack via Compose
 └── data/                           # Persistent state directory (ignored by git)
     ├── adguard/                    # AdGuard configuration and query logs
     │   ├── conf/AdGuardHome.yaml
@@ -115,6 +117,13 @@ docker compose down
 # Recreate a specific container after configuration changes
 docker compose up -d --force-recreate hermes
 ```
+
+### Updating Images (Automatic)
+`scripts/update-stack.sh` is the only supported updater. It pulls, recreates through Compose (dependency order), waits for health, and prunes dangling images. Install it on the host as a daily cron job:
+```bash
+crontab -l | { cat; echo "0 4 * * * cd $(pwd) && ./scripts/update-stack.sh"; } | crontab -
+```
+Logs append to `data/update.log` (rotated at 1 MB).
 
 ### Checking Service Health & Logs
 ```bash
@@ -165,7 +174,7 @@ docker compose exec -it hermes hermes config set model.default <provider>/<model
   - Always keep `name: tailscale-services` at the root.
   - Every service must attach the `x-logging: &default-logging` anchor (`<<: *default-logging`) to prevent unbounded disk usage.
   - Sub-services must keep `depends_on: tailscale: { condition: service_healthy }`. Do not add shell-based healthchecks to `rustdesk` as its minimalist container image lacks utilities like `pgrep` or `curl`.
-  - Ensure memory limits, restart policies, and Watchtower labels (`com.centurylinklabs.watchtower.depends-on=tailscale`) are preserved when adding services.
+  - Ensure memory limits and restart policies are preserved when adding services.
   - Never add host-bound `ports:` mappings. All services must be routed strictly through `network_mode: "service:tailscale"`.
   - The only permitted mapping is `41641:41641/udp` on `tailscale` (fixed WireGuard port; removing it reintroduces iOS reconnection drops).
 - **Healthchecks Must Be Real:** Never add catch-all fallbacks such as `|| test -e /proc/net/tcp` — they report healthy while the service is broken. Probe the actual service (`nc -z 127.0.0.1 53` for AdGuard, `GET /api/health` for Hermes).

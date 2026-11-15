@@ -233,27 +233,24 @@ Because `TS_EXTRA_ARGS=--advertise-exit-node` is enabled by default, this node i
 
 ## Maintenance & Automatic Updates
 
-### Automatic Updates (Watchtower)
-**Watchtower** is included in the stack and configured to check Docker Hub daily at **04:00 AM UTC**:
-- **Zero Downtime if No Update:** Watchtower queries Docker Hub's API. If no new image hash exists, nothing is restarted.
-- **Tailscale Is Excluded:** The `tailscale` container carries `com.centurylinklabs.watchtower.enable=false`. Recreating it would orphan every `network_mode: service:tailscale` container, so update it manually:
-  ```bash
-  docker compose pull tailscale && docker compose up -d
-  ```
-- **Dependency Aware:** `adguardhome`, `rustdesk-hbbs`, `rustdesk-hbbr`, and `hermes` are tagged with `com.centurylinklabs.watchtower.depends-on=tailscale`.
-- **Auto Clean:** Automatically prunes old dangling image layers (`WATCHTOWER_CLEANUP=true`).
+### Automatic Updates (cron + Compose)
+There is no updater container. `scripts/update-stack.sh` pulls new images and recreates the stack **through Compose**, which is the only safe way to update `tailscale`: every dependent service joins its network namespace by container ID, so recreating it outside Compose leaves them on a dead namespace.
 
-To view Watchtower status and next scheduled run:
+Install it as a daily job on the host (04:00):
 ```bash
-docker compose logs -f watchtower
+crontab -l | { cat; echo "0 4 * * * cd $(pwd) && ./scripts/update-stack.sh"; } | crontab -
 ```
 
+What it does:
+- `docker compose pull` — nothing is recreated when no image changed.
+- `tailscale` image changed → `up -d --force-recreate --wait`, so `tailscale` is rebuilt first and every dependent re-attaches to the new namespace.
+- Otherwise → `up -d --wait`, recreating only services whose image changed; if the health check fails it retries with a full recreate.
+- `docker image prune -f` — drops dangling layers.
+- Output appends to `data/update.log` (rotated at 1 MB).
+
 ### Manual Updates (On-Demand)
-If you prefer to trigger updates manually at any time:
 ```bash
-docker compose pull
-docker compose up -d
-docker image prune -f
+./scripts/update-stack.sh
 ```
 
 ### Inspecting Logs
@@ -263,7 +260,7 @@ docker compose logs -f adguardhome
 docker compose logs -f rustdesk-hbbs
 docker compose logs -f rustdesk-hbbr
 docker compose logs -f hermes
-docker compose logs -f watchtower
+tail -f data/update.log
 ```
 
 ### Restoring Pre-Configured Settings
