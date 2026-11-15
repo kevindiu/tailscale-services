@@ -179,7 +179,7 @@ On any RustDesk client connected to your Tailnet:
 You can access the full Hermes Web Dashboard directly in your browser:
 - **URL:** `http://tailscale-services:9119` (or `http://<TAILSCALE_IP>:9119`)
 - **Default Username:** `admin`
-- **Default Password:** `admin` *(configurable via `HERMES_DASHBOARD_PASSWORD` in `.env`)*
+- **Password:** set `HERMES_DASHBOARD_PASSWORD` in `.env` (required — the stack refuses to start without it)
 
 Features included in the Web UI:
 - Live web chat with Hermes
@@ -236,7 +236,11 @@ Because `TS_EXTRA_ARGS=--advertise-exit-node` is enabled by default, this node i
 ### Automatic Updates (Watchtower)
 **Watchtower** is included in the stack and configured to check Docker Hub daily at **04:00 AM UTC**:
 - **Zero Downtime if No Update:** Watchtower queries Docker Hub's API. If no new image hash exists, nothing is restarted.
-- **Dependency Aware:** `adguardhome`, `rustdesk-hbbs`, `rustdesk-hbbr`, and `hermes` are tagged with `com.centurylinklabs.watchtower.depends-on=tailscale`. If the Tailscale container updates, Watchtower automatically recreates the dependent containers so they re-attach to the new network namespace seamlessly.
+- **Tailscale Is Excluded:** The `tailscale` container carries `com.centurylinklabs.watchtower.enable=false`. Recreating it would orphan every `network_mode: service:tailscale` container, so update it manually:
+  ```bash
+  docker compose pull tailscale && docker compose up -d
+  ```
+- **Dependency Aware:** `adguardhome`, `rustdesk-hbbs`, `rustdesk-hbbr`, and `hermes` are tagged with `com.centurylinklabs.watchtower.depends-on=tailscale`.
 - **Auto Clean:** Automatically prunes old dangling image layers (`WATCHTOWER_CLEANUP=true`).
 
 To view Watchtower status and next scheduled run:

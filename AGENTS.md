@@ -52,7 +52,8 @@ This file documents the architecture, operational workflows, and security invari
 
 1. **Zero Open WAN / Host Ports:**
    - **Never** add host port mappings (`ports:`) to `docker-compose.yml`.
-   - All inbound traffic must travel exclusively through the encrypted Tailscale network namespace.
+   - **Single exception:** `41641:41641/udp` on `tailscale`, which pins the WireGuard endpoint and prevents iOS/mobile reconnection drops. Never remove or widen it.
+   - All other inbound traffic must travel exclusively through the encrypted Tailscale network namespace.
 2. **Network Sharing:**
    - Dependent services (`adguardhome`, `rustdesk-hbbs`, `rustdesk-hbbr`, `hermes`) must retain `network_mode: "service:tailscale"`.
 3. **Docker Socket Isolation:**
@@ -64,6 +65,9 @@ This file documents the architecture, operational workflows, and security invari
 5. **Least Privilege & Resource Limits:**
    - Tailscale runs with `cap_drop: ALL` and only `NET_ADMIN` + `NET_RAW`.
    - All containers have explicit memory caps in `docker-compose.yml` to prevent host exhaustion.
+6. **Watchtower Must Never Recreate `tailscale`:**
+   - Keep `com.centurylinklabs.watchtower.enable=false` on the `tailscale` service. Recreating it orphans every `network_mode: service:tailscale` container (they hold a stale netns reference).
+   - Tailscale is updated manually: `docker compose pull tailscale && docker compose up -d`.
 
 ---
 
@@ -163,5 +167,7 @@ docker compose exec -it hermes hermes config set model.default <provider>/<model
   - Sub-services must keep `depends_on: tailscale: { condition: service_healthy }`. Do not add shell-based healthchecks to `rustdesk` as its minimalist container image lacks utilities like `pgrep` or `curl`.
   - Ensure memory limits, restart policies, and Watchtower labels (`com.centurylinklabs.watchtower.depends-on=tailscale`) are preserved when adding services.
   - Never add host-bound `ports:` mappings. All services must be routed strictly through `network_mode: "service:tailscale"`.
+  - The only permitted mapping is `41641:41641/udp` on `tailscale` (fixed WireGuard port; removing it reintroduces iOS reconnection drops).
+- **Healthchecks Must Be Real:** Never add catch-all fallbacks such as `|| test -e /proc/net/tcp` — they report healthy while the service is broken. Probe the actual service (`nc -z 127.0.0.1 53` for AdGuard, `GET /api/health` for Hermes).
 - **Tailscale DNS Isolation:** Always keep `TS_ACCEPT_DNS=false` on the `tailscale` container to prevent DNS loop deadlocks with AdGuard Home.
 - **Handling Secrets:** Never commit `.env` or files under `data/` to git. Never insert real API keys or OAuth secrets into `env.example` or compose fallbacks.

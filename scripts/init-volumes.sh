@@ -20,6 +20,6 @@ mkdir -p "${DATA_DIR}/hermes"
 chmod 700 "${DATA_DIR}/tailscale"
 chmod 700 "${DATA_DIR}/adguard"
 chmod 700 "${DATA_DIR}/rustdesk"
-chmod 755 "${DATA_DIR}/hermes"
+chmod 700 "${DATA_DIR}/hermes"
 
 echo "[✓] Directory initialization complete."

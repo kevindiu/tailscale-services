@@ -87,9 +87,8 @@ dns:
   upstream_timeout: 10s
   private_networks:
     - 100.64.0.0/10
-  use_private_ptr_resolvers: true
-  local_ptr_upstreams:
-    - 100.100.100.100
+  use_private_ptr_resolvers: false
+  local_ptr_upstreams: []
   use_dns64: false
   dns64_prefixes: []
   serve_http3: false

@@ -14,7 +14,7 @@ services:
     container_name: tailscale
     hostname: ${TAILSCALE_HOSTNAME:-tailscale-services}
     environment:
-      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_AUTHKEY=${TS_AUTHKEY:?TS_AUTHKEY must be set in .env}
       - TS_AUTH_ONCE=true
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
@@ -54,6 +54,12 @@ services:
     # eliminating the "silent blackhole" connection drop on iOS/iPadOS clients.
     ports:
       - "41641:41641/udp"
+    labels:
+      # Never let Watchtower recreate this container: every dependent service
+      # shares its network namespace, and a recreated tailscale container
+      # orphans them (they keep a stale netns reference). Update the stack
+      # manually with: docker compose pull && docker compose up -d
+      - "com.centurylinklabs.watchtower.enable=false"
     # SECURITY NOTE: Do NOT expose internal service ports (DNS, Web UI, RustDesk) to the host interface on a public VPS.
     # Leaving internal service ports unmapped guarantees traffic is reachable ONLY via your private Tailscale network.
     # ports:
@@ -78,6 +84,8 @@ services:
       resources:
         limits:
           memory: 512M
+    security_opt:
+      - no-new-privileges:true
     labels:
       # Ensures Watchtower safely recreates AdGuard if Tailscale is updated
       - "com.centurylinklabs.watchtower.depends-on=tailscale"
@@ -85,7 +93,7 @@ services:
       tailscale:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "/opt/adguardhome/AdGuardHome --version && (nc -z -w2 127.0.0.1 53 || test -e /proc/net/tcp || exit 1)"]
+      test: ["CMD-SHELL", "nc -z -w2 127.0.0.1 53 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -178,7 +186,7 @@ services:
         limits:
           memory: 2G
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9119/', timeout=3)\" || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9119/api/health', timeout=3)\" || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -198,8 +206,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      # Explicit API version negotiation with modern Docker daemons
-      - DOCKER_API_VERSION=1.45
       # Clean up old, unused image layers after updating
       - WATCHTOWER_CLEANUP=true
       # Check daily at 04:00 AM (6-field cron: sec min hour day month weekday)
@@ -210,4 +216,3 @@ services:
       resources:
         limits:
           memory: 128M
-
