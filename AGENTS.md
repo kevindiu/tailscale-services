@@ -174,7 +174,8 @@ docker compose exec -it hermes hermes config set model.default <provider>/<model
   - Always keep `name: tailscale-services` at the root.
   - Every service must attach the `x-logging: &default-logging` anchor (`<<: *default-logging`) to prevent unbounded disk usage.
   - Sub-services must keep `depends_on: tailscale: { condition: service_healthy }`. Do not add shell-based healthchecks to `rustdesk` as its minimalist container image lacks utilities like `pgrep` or `curl`.
-  - Ensure memory limits, restart policies, `pids_limit`, and `TZ=${TZ:-Asia/Tokyo}` are preserved when adding services.
+  - Ensure memory limits, restart policies, PID caps (`deploy.resources.limits.pids`, **never** the top-level `pids_limit`), and `TZ=${TZ:-Asia/Tokyo}` are preserved when adding services.
+  - Compose v2 rejects `pids_limit` when a `deploy.resources.limits` block exists ("can't set distinct values…"), so keep every cap inside `deploy.resources.limits`.
   - Services that write state on shutdown need `stop_grace_period` (Hermes uses 30s for SQLite).
   - Never add host-bound `ports:` mappings. All services must be routed strictly through `network_mode: "service:tailscale"`.
   - The only permitted mapping is `41641:41641/udp` on `tailscale` (fixed WireGuard port; removing it reintroduces iOS reconnection drops).
