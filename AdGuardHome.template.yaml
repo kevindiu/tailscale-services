@@ -21,11 +21,11 @@ http:
       - GET /dns-query/{ClientID}
       - POST /dns-query/{ClientID}
     insecure_enabled: false
-  address: 0.0.0.0:80
+  address: 0.0.0.0:3000
   session_ttl: 30d
 
 # Credentials sanitized: add your user here or create one on initial setup.
-# WARNING: with `users: []` the first client on the tailnet to reach port 80
+# WARNING: with `users: []` the first client on the tailnet to reach port 3000
 # can claim the admin account. Set a user immediately after restoring this file.
 # Example:
 # users:

@@ -30,14 +30,14 @@ There is no updater container. Images are refreshed manually with `docker compos
 |  |    Exit Node: Enabled by default (--advertise-exit-node)                            |  |
 |  +-------------------------------------------+-----------------------------------------+  |
 |                                              | network_mode: "service:tailscale"          |
-|             +------------------+-------------+------------------+                        |
-|             |                  |                                |                        |
-|  +----------v--------+  +------v-------------+  +---------------v---------+             |
-|  |   AdGuard Home    |  |  RustDesk Server   |  |      Hermes Agent       |             |
-|  |  Port 53 (DNS)    |  |  hbbs: 21115-21116 |  |  Port 9119 (Web UI)     |             |
-|  |  Port 3000 / 80   |  |  hbbr: 21117       |  |  Telegram Gateway       |             |
-|  |  (Web Dashboard)  |  |  Auth: Public Key  |  |  Memory Cap: 2GB        |             |
-|  +-------------------+  +--------------------+  +-------------------------+             |
+|             +------------------+-------------+------------------+                         |
+|             |                  |                                |                         |
+|  +----------v--------+  +------v-------------+  +---------------v---------+               |
+|  |   AdGuard Home    |  |  RustDesk Server   |  |      Hermes Agent       |               |
+|  |  Port 53 (DNS)    |  |  hbbs: 21115-21116 |  |  Port 9119 (Web UI)     |               |
+|  |  Port 3000        |  |  hbbr: 21117       |  |  Telegram Gateway       |               |
+|  |  (Web Dashboard)  |  |  Auth: Public Key  |  |  Memory Cap: 2GB        |               |
+|  +-------------------+  +--------------------+  +-------------------------+               |
 +-------------------------------------------------------------------------------------------+
                                                   ^
                                                   | Private WireGuard Mesh

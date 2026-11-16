@@ -7,34 +7,34 @@ A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdG
 ## Architecture & Security Model
 
 ```
-+-----------------------------------------------------------------------------------------+
-|                                       Docker Host                                       |
-|                                                                                         |
-|  +-----------------------------------------------------------------------------------+  |
-|  |                        Tailscale Container (Network Owner)                        |  |
++------------------------------------------------------------------------------------------+
+|                                       Docker Host                                        |
+|                                                                                          |
+|  +-----------------------------------------------------------------------------------+   |
+|  |                        Tailscale Container (Network Owner)                        |   |
 |  |       IP: 100.x.y.z | Hostname: tailscale-services                                 |  |
 |  |       Exit Node: Enabled by default | No tags required                             |  |
-|  |       Capabilities: ALL dropped, only NET_ADMIN + NET_RAW                         |  |
-|  |       Memory Cap: 256MB                                                           |  |
-|  +-----------------------------------------+-----------------------------------------+  |
-|                                            | (network_mode: service:tailscale)          |
-|                    +-----------------------+-----------------------+                    |
-|                    |                       |                       |                    |
-|  +-----------------v-----------------+  +--v--------------------+  +--v--------------+  |
-|  |           AdGuard Home            |  |    RustDesk Server    |  | Hermes AI Agent |  |
-|  |  Port 53 (DNS - open to Tailnet)  |  |  hbbs: 21115, 21116   |  | Port 9119 (Web) |  |
-|  |  Port 3000 / 80 (Admin ACL)       |  |  hbbr: 21117 (Relay)  |  | Telegram Gateway|  |
-|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | Dashboard: 9119 |  |
-|  |  DNSSEC: Enabled                  |  |  Memory Cap: 256MB    |  | Memory Cap: 2GB |  |
-|  |  Memory Cap: 512MB                |  |                       |  |                 |  |
-|  +-----------------------------------+  +-----------------------+  +-----------------+  |
-+-----------------------------------------------------------------------------------------+
+|  |       Capabilities: ALL dropped, only NET_ADMIN + NET_RAW                         |   |
+|  |       Memory Cap: 256MB                                                           |   |
+|  +-----------------------------------------+-----------------------------------------+   |
+|                                            | (network_mode: service:tailscale)           |
+|                    +-----------------------+-----------------------+                     |
+|                    |                       |                       |                     |
+|  +-----------------v-----------------+  +--v--------------------+  +--v--------------+   |
+|  |           AdGuard Home            |  |    RustDesk Server    |  | Hermes AI Agent |   |
+|  |  Port 53 (DNS - open to Tailnet)  |  |  hbbs: 21115, 21116   |  | Port 9119 (Web) |   |
+|  |  Port 3000 (Admin ACL)            |  |  hbbr: 21117 (Relay)  |  | Telegram Gateway|   |
+|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | Dashboard: 9119 |   |
+|  |  DNSSEC: Enabled                  |  |  Memory Cap: 256MB    |  | Memory Cap: 2GB |   |
+|  |  Memory Cap: 512MB                |  |                       |  |                 |   |
+|  +-----------------------------------+  +-----------------------+  +-----------------+   |
++------------------------------------------------------------------------------------------+
                                              ^
                                              | End-to-end WireGuard tunnel (Zero open WAN ports)
                                              v
                                Your Private Tailscale Network
                       - All devices query DNS on port 53
-                      - Only admin devices can access web dashboard (80/3000),
+                      - Only admin devices can access web dashboard (3000),
                         RustDesk (21115-21119), and Hermes Web UI (9119)
 ```
 
@@ -110,8 +110,8 @@ To prevent Tailscale from disconnecting after 180 days:
 
 1. Find the assigned Tailscale IP in **[Tailscale Machines](https://login.tailscale.com/admin/machines)**.
 2. From an **admin device**, access the AdGuard Home Web UI:
-   - **Using `AdGuardHome.template.yaml` (recommended):** The Web UI binds directly to **port 80** (`http://<TAILSCALE_IP>` or `http://tailscale-services`).
-   - **Clean initial setup (no template):** AdGuard's initial setup wizard binds to **port 3000** (`http://<TAILSCALE_IP>:3000`).
+   - The Web UI always binds to **port 3000**: `http://tailscale-services:3000` (or `http://<TAILSCALE_IP>:3000`).
+   - If you restored `AdGuardHome.template.yaml`, the admin account is empty — set a username and password immediately, anyone on the tailnet can reach that port.
 3. Complete the setup wizard (set admin username and a strong 16+ character password) if configuring without a pre-existing config.
 4. **Configure Encrypted Upstream DNS:**
    - In AdGuard, navigate to **Settings → DNS Settings**.
@@ -271,4 +271,6 @@ mkdir -p data/adguard/conf
 cp AdGuardHome.template.yaml data/adguard/conf/AdGuardHome.yaml
 docker compose restart adguardhome
 ```
-Open the web UI to set your admin username and password.
+Open `http://tailscale-services:3000` and set your admin username and password immediately.
+
+> **Existing deployment?** The template only affects a restore. To move the port on a running instance, edit `http.address` in `data/adguard/conf/AdGuardHome.yaml` to `0.0.0.0:3000` and `docker compose restart adguardhome`.

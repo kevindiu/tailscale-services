@@ -62,7 +62,6 @@ services:
     #   - "53:53/tcp"
     #   - "53:53/udp"
     #   - "3000:3000/tcp"
-    #   - "80:80/tcp"
     #   - "21115-21119:21115-21119/tcp"
     #   - "21116:21116/udp"
 
@@ -85,7 +84,7 @@ services:
         limits:
           memory: 512M
           pids: 256
-    # No cap_drop: AdGuard binds :53/:80 and writes ./data/adguard (mode 700, owned
+    # No cap_drop: AdGuard binds :53/:3000 and writes ./data/adguard (mode 700, owned
     # by the host user). Dropping ALL capabilities would remove DAC_OVERRIDE and
     # NET_BIND_SERVICE, so the container could neither write its volumes nor bind.
     security_opt:
