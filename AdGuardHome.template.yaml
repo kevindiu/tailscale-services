@@ -1,15 +1,7 @@
-# AdGuard Home Configuration Template (Sanitized Backup)
-# Generated from working production setup with performance & security tuning.
-#
-# To restore:
-# 1. Stop AdGuard Home first (`docker compose stop adguardhome`) so it does not overwrite the file on exit.
-# 2. Copy this file to data/adguard/conf/AdGuardHome.yaml
-# 3. Replace the default `admin` / `admin` password hash below before starting AdGuard Home.
-#
-# schema_version below was captured from a specific AdGuard Home release.
-# AdGuard migrates older schemas upward automatically, but refuses a template
-# newer than the running binary — if the container won't start after a restore,
-# delete schema_version and let AdGuard rebuild the file.
+# AdGuard Home configuration template.
+# Restore: stop `adguardhome`, copy to data/adguard/conf/AdGuardHome.yaml,
+# replace the default `admin`/`admin` bcrypt hash, then start `adguardhome`.
+# Delete `schema_version` at the bottom if an older AdGuard binary rejects it.
 
 http:
   pprof:
@@ -22,13 +14,10 @@ http:
       - GET /dns-query/{ClientID}
       - POST /dns-query/{ClientID}
     insecure_enabled: false
-  address: 0.0.0.0:3000
+  address: 127.0.0.1:3000 # Exposed via Tailscale Serve HTTPS (:3443)
   session_ttl: 30d
 
-# Default credentials for restored template: admin / admin
-# WARNING: Change this password immediately! Generate a new bcrypt hash interactively with:
-#   htpasswd -nBC 10 "" | sed 's/^://'
-# Stop adguardhome before editing AdGuardHome.yaml so it does not overwrite your change on exit.
+# Default: admin / admin — replace hash with `htpasswd -nBC 10 "" | sed 's/^://'`
 users:
   - name: admin
     password: "$2y$10$fBzRaX8fNdbNshIjLxwvTu0F6JEX5um/bQg4znQBcgLZWGcINQzWy"
@@ -49,8 +38,7 @@ dns:
   ratelimit_whitelist: []
   refuse_any: true
   upstream_dns:
-    # Optional: if non-MagicDNS clients need tailnet lookups, scope strictly to your
-    # own tailnet suffix (avoid broad [/ts.net/], which can loop on external Funnel domains):
+    # Optional tailnet lookup for non-MagicDNS clients (scope to your suffix, not /ts.net/):
     # - '[/<your-tailnet>.ts.net/]100.100.100.100'
     - tls://dns.quad9.net
     - https://dns.quad9.net/dns-query
@@ -97,11 +85,8 @@ dns:
   private_networks:
     - 100.64.0.0/10
   use_private_ptr_resolvers: true
-  # MagicDNS answers PTR for 100.64/10. Safe at startup because AdGuard only
-  # starts after tailscale reports healthy; queries stall only while tailscaled
-  # is down (upstream_timeout bounds them).
   local_ptr_upstreams:
-    - 100.100.100.100
+    - 100.100.100.100 # MagicDNS PTR for 100.64.0.0/10
   use_dns64: false
   dns64_prefixes: []
   serve_http3: false

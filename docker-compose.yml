@@ -19,11 +19,8 @@ services:
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
       - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---advertise-exit-node}
-      # Prevent DNS deadlock/loops: daemon always resolves coordination server via host DNS
-      - TS_ACCEPT_DNS=false
-      # Fixed WireGuard port prevents iOS/mobile P2P connection drops across restarts
+      - TS_ACCEPT_DNS=false # Prevents DNS loop deadlock with AdGuard
       - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0 --port=41641
-      # Declarative Tailscale Serve config for tailnet-only HTTPS (requires HTTPS enabled in Tailscale Admin -> DNS)
       - TS_SERVE_CONFIG=/config/serve.json
       - TZ=${TZ:-Asia/Tokyo}
     sysctls:
@@ -31,12 +28,8 @@ services:
       - net.ipv6.conf.all.forwarding=1
     volumes:
       - ./data/tailscale:/var/lib/tailscale
-      # Mount parent directory (not single file) read-only so containerboot can watch serve.json
-      - ./config:/config:ro
+      - ./config:/config:ro # Directory mount required for containerboot config watch
       - /dev/net/tun:/dev/net/tun
-    # Least privilege: drop all Linux capabilities, grant only networking caps
-    # plus DAC_OVERRIDE so UID 0 can access ./data/tailscale (mode 700, owned by host user) on Linux.
-    # Note: if you add port 443 to config/serve.json later, also add NET_BIND_SERVICE here.
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -44,44 +37,30 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
-      - DAC_OVERRIDE
-    # Resource constraints to prevent DoS or memory exhaustion
+      - DAC_OVERRIDE # Access host-owned mode-700 ./data/tailscale on Linux
+      # Add NET_BIND_SERVICE if binding port 443 in config/serve.json
     deploy:
       resources:
         limits:
           memory: 256M
           pids: 256
     restart: unless-stopped
-    # BackendState check: `tailscale status` alone still exits 0 when the node is
-    # logged out or its key expired, which would let dependents start with no network.
+    # Check BackendState explicitly (`tailscale status` exits 0 even when logged out)
     healthcheck:
       test: ["CMD-SHELL", "tailscale status --json | grep -q '\"BackendState\":[[:space:]]*\"Running\"' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
-    # Fixed UDP port mapping for Tailscale WireGuard direct connections.
-    # Prevents Docker from assigning random ephemeral ports on container restart,
-    # eliminating the "silent blackhole" connection drop on iOS/iPadOS clients.
+    # Only host-mapped port: pins WireGuard UDP port to prevent iOS/mobile drops
     ports:
       - "41641:41641/udp"
-    # SECURITY NOTE: Do NOT expose internal service ports (DNS, Web UI, RustDesk) to the host interface on a public VPS.
-    # Leaving internal service ports unmapped guarantees traffic is reachable ONLY via your private Tailscale network.
-    # ports:
-    #   - "53:53/tcp"
-    #   - "53:53/udp"
-    #   - "3000:3000/tcp"
-    #   - "21115-21119:21115-21119/tcp"
-    #   - "21116:21116/udp"
 
   adguardhome:
     <<: *default-logging
     image: adguard/adguardhome:latest
     container_name: adguardhome
     restart: unless-stopped
-    # Shares Tailscale's network namespace. AdGuard binds 0.0.0.0 inside it, so the
-    # only reachable interfaces are tailscale0 and the container's bridge interface
-    # (no host ports are published).
     network_mode: "service:tailscale"
     environment:
       - TZ=${TZ:-Asia/Tokyo}
@@ -93,8 +72,6 @@ services:
         limits:
           memory: 512M
           pids: 256
-    # Drop all capabilities (including NET_RAW inside tailscale's shared netns) and keep
-    # only NET_BIND_SERVICE (:53) and DAC_OVERRIDE (mode 700 ./data/adguard owned by host user).
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -113,14 +90,12 @@ services:
       retries: 3
       start_period: 15s
 
-  # RustDesk ID / Rendezvous Server
   rustdesk-hbbs:
     <<: *default-logging
     image: rustdesk/rustdesk-server:latest
     container_name: rustdesk-hbbs
     restart: unless-stopped
     network_mode: "service:tailscale"
-    # -k _ enforces key authentication using the automatically generated key pair
     command: hbbs -r ${RUSTDESK_RELAY_HOST:-tailscale-services}:21117 -k _
     environment:
       - TZ=${TZ:-Asia/Tokyo}
@@ -130,7 +105,6 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # DAC_OVERRIDE allows UID 0 to access ./data/rustdesk (mode 700, owned by host user) on Linux
     cap_add:
       - DAC_OVERRIDE
     deploy:
@@ -143,7 +117,6 @@ services:
         condition: service_healthy
         restart: true
 
-  # RustDesk Relay Server
   rustdesk-hbbr:
     <<: *default-logging
     image: rustdesk/rustdesk-server:latest
@@ -159,7 +132,6 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # DAC_OVERRIDE allows UID 0 to access ./data/rustdesk (mode 700, owned by host user) on Linux
     cap_add:
       - DAC_OVERRIDE
     deploy:
@@ -174,14 +146,12 @@ services:
       rustdesk-hbbs:
         condition: service_started
 
-  # Hermes AI Agent (Autonomous Agent & Gateway)
   hermes:
     <<: *default-logging
     image: nousresearch/hermes-agent:latest
     container_name: hermes
     restart: unless-stopped
-    # SQLite state needs more than the 10s default before SIGKILL
-    stop_grace_period: 30s
+    stop_grace_period: 30s # Clean SQLite shutdown
     command: gateway run
     network_mode: "service:tailscale"
     volumes:
@@ -190,15 +160,12 @@ services:
       - TZ=${TZ:-Asia/Tokyo}
       - HERMES_UID=10000
       - HERMES_GID=10000
-      # LLM Provider Keys: recommended via `docker compose exec -it hermes hermes setup`
-      # (stored in data/hermes/.env). Uncomment below only if injecting from root .env —
-      # leaving empty strings set here can shadow keys saved in data/hermes/.env.
+      # Optional: inject LLM keys from .env instead of `hermes setup` (avoid empty values)
       # - OPENAI_API_KEY=${HERMES_OPENAI_API_KEY:?}
       # - ANTHROPIC_API_KEY=${HERMES_ANTHROPIC_API_KEY:?}
       # - OPENROUTER_API_KEY=${HERMES_OPENROUTER_API_KEY:?}
-      # Hermes Web Dashboard (always enabled; accessible over Tailscale at http://tailscale-services:9119)
       - HERMES_DASHBOARD=true
-      - HERMES_DASHBOARD_HOST=0.0.0.0
+      - HERMES_DASHBOARD_HOST=127.0.0.1 # Exposed via Tailscale Serve HTTPS (:9443)
       - HERMES_DASHBOARD_PORT=9119
       - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${HERMES_DASHBOARD_USER:-admin}
       - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${HERMES_DASHBOARD_PASSWORD:?HERMES_DASHBOARD_PASSWORD must be set in .env}
@@ -206,9 +173,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Remap + own /opt/data at boot: CHOWN/FOWNER/DAC_OVERRIDE for the chown,
-    # SETUID/SETGID to drop to HERMES_UID. Remove them if HERMES_UID already
-    # matches the owner of ./data/hermes.
+    # Required for entrypoint chown + UID/GID drop to HERMES_UID
     cap_add:
       - CHOWN
       - DAC_OVERRIDE
