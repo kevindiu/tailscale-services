@@ -1,276 +1,108 @@
-# Hardened Tailscale + AdGuard Home + RustDesk Server + Hermes AI Agent in Docker
+# tailscale-services
 
-A production-grade, hardened Docker Compose stack that runs **Tailscale**, **AdGuard Home**, a **RustDesk Relay Server (`hbbs` + `hbbr`)**, and an isolated **Hermes AI Agent** in a private, encrypted Tailscale network mesh.
+A hardened Docker Compose stack running **Tailscale**, **AdGuard Home**, **RustDesk Server (`hbbs` + `hbbr`)**, and **Hermes AI Agent** inside a private Tailscale WireGuard mesh.
+
+## Services
+
+All application containers share Tailscale's network namespace (`network_mode: "service:tailscale"`). No application ports are exposed to the host or WAN.
+
+| Service | Purpose | Ports (Tailnet) | Limits |
+| :--- | :--- | :--- | :--- |
+| **`tailscale`** | WireGuard mesh, MagicDNS (`tailscale-services`), Exit Node, HTTPS Serve | `41641/udp` *(host-mapped)*, `3443`/`9443` (HTTPS) | 256M / 256 PIDs |
+| **`adguardhome`** | Ad-blocking DNS (DoH/DoT + DNSSEC) | `53` (DNS), `3000` (HTTP) / `3443` (HTTPS) | 512M / 256 PIDs |
+| **`rustdesk-hbbs` / `hbbr`** | Self-hosted RustDesk ID & relay (`-k _`) | `21115–21119` | 256M / 256 PIDs each |
+| **`hermes`** | Containerized Hermes AI Agent + Web UI | `9119` (HTTP) / `9443` (HTTPS, Basic Auth) | 2G / 1024 PIDs |
+
+### Security Highlights
+- **Zero open application ports:** Only `41641/udp` is published on the host to pin the WireGuard port and prevent iOS/mobile reconnection drops.
+- **Least privilege:** Every container runs with `no-new-privileges:true`, `cap_drop: ALL`, minimal `cap_add`, memory/PID limits, and rotating logs.
+- **Isolated runtime:** No container mounts `/var/run/docker.sock`. Hermes runs 100% in Docker under UID/GID `10000` with `./data/hermes` (`chmod 700`).
 
 ---
 
-## Architecture & Security Model
+## Quick Start
 
+### 1. Generate a Tailscale Auth Key
+In **[Tailscale Admin → Keys](https://login.tailscale.com/admin/settings/keys)**, click **Generate auth key**, check **Reusable** and **Pre-approved** (no tags needed), and copy the key (`tskey-auth-...`).
+
+### 2. Configure `.env` and Launch
+```bash
+cp env.example .env
+chmod 600 .env
 ```
-+------------------------------------------------------------------------------------------+
-|                                       Docker Host                                        |
-|                                                                                          |
-|  +-----------------------------------------------------------------------------------+   |
-|  |                        Tailscale Container (Network Owner)                        |   |
-|  |       IP: 100.x.y.z | Hostname: tailscale-services                                 |  |
-|  |       Exit Node: Enabled by default | No tags required                             |  |
-|  |       Capabilities: ALL dropped, only NET_ADMIN + NET_RAW                         |   |
-|  |       Memory Cap: 256MB                                                           |   |
-|  +-----------------------------------------+-----------------------------------------+   |
-|                                            | (network_mode: service:tailscale)           |
-|                    +-----------------------+-----------------------+                     |
-|                    |                       |                       |                     |
-|  +-----------------v-----------------+  +--v--------------------+  +--v--------------+   |
-|  |           AdGuard Home            |  |    RustDesk Server    |  | Hermes AI Agent |   |
-|  |  Port 53 (DNS - open to Tailnet)  |  |  hbbs: 21115, 21116   |  | Port 9119 (Web) |   |
-|  |  Port 3000 (Admin ACL)            |  |  hbbr: 21117 (Relay)  |  | Telegram Gateway|   |
-|  |  Upstream: Encrypted DoH / DoT    |  |  Auth: Public Key     |  | Dashboard: 9119 |   |
-|  |  DNSSEC: Enabled                  |  |  Memory Cap: 256MB    |  | Memory Cap: 2GB |   |
-|  |  Memory Cap: 512MB                |  |                       |  |                 |   |
-|  +-----------------------------------+  +-----------------------+  +-----------------+   |
-+------------------------------------------------------------------------------------------+
-                                             ^
-                                             | End-to-end WireGuard tunnel (Zero open WAN ports)
-                                             v
-                               Your Private Tailscale Network
-                      - All devices query DNS on port 53
-                      - Only admin devices can access web dashboard (3000),
-                        RustDesk (21115-21119), and Hermes Web UI (9119)
+Edit `.env` and set at least `TS_AUTHKEY` and a strong `HERMES_DASHBOARD_PASSWORD` (the stack refuses to start without both), then launch:
+```bash
+./scripts/init-volumes.sh
+docker compose up -d
+docker compose ps
 ```
 
-### Security Invariants
-- **No WAN / Open Resolver risk:** No application service ports (DNS, Web, RustDesk, Agent) are mapped to the host interface. AdGuard Home is physically unreachable by the public internet or external port scanners.
-- **Fixed WireGuard UDP Port (iOS / Mobile Drop Mitigation):** Maps `41641:41641/udp` directly to Tailscale. This prevents Docker from assigning ephemeral, shifting outbound ports upon container restart, eliminating the "silent blackhole" connection drops on iOS/iPadOS clients.
-- **Tailscale ACL isolation:** Devices on your Tailnet can send DNS queries to port `53`, but only designated admin devices can reach the AdGuard dashboard, RustDesk ports, or Hermes Agent API.
-- **Isolated Container Boundary (Hermes AI Agent):**
-  - **Zero Host Processes:** Hermes runs 100% inside Docker. No scripts or services run on your Mac.
-  - **Scoped Host Mount:** Hermes state is stored under `./data/hermes`.
-  - **Zero Docker Socket Access:** `/var/run/docker.sock` is NOT mounted into Hermes, strictly preventing container escapes or host filesystem mounts.
-  - **Least Privilege:** Runs with `no-new-privileges:true`, unprivileged UID/GID (10000), and memory limits enforced.
-- **Zero Tagging Hassle:** No complex ACL tag configurations required. Simply click "Disable key expiry" in the Tailscale admin console for permanent, uninterrupted uptime.
-- **Built-in Exit Node:** Advertised by default (`TS_EXTRA_ARGS=--advertise-exit-node`), allowing you to use this node as a secure full VPN when traveling or on public Wi-Fi.
-- **DNS privacy against ISP:** AdGuard resolves upstream queries using DNS-over-HTTPS (DoH) or DNS-over-TLS (DoT) with DNSSEC validation enabled.
-- **Principle of Least Privilege:** `cap_drop: ALL` with only `NET_ADMIN` and `NET_RAW` granted to Tailscale for tunnel operation. Memory limits enforced on all containers.
-
----
-
-## Step-by-Step Setup
-
-### Step 1: Generate Auth Key
-
-1. Go to **[Tailscale Admin → Settings → Keys](https://login.tailscale.com/admin/settings/keys)**.
-2. Click **Generate auth key...**:
-   - Check **Reusable**.
-   - Check **Pre-approved**.
-   - *(No tags needed!)*
-3. Copy the generated key (`tskey-auth-...`).
-
----
-
-### Step 2: Configure Environment & Launch Stack
-
-1. Copy `env.example` to `.env`:
+### 3. Configure Tailscale Admin
+1. **Disable key expiry:** In **[Machines](https://login.tailscale.com/admin/machines)**, open `...` next to `tailscale-services` → **Disable key expiry**.
+   > `TS_AUTH_ONCE=true` consumes `TS_AUTHKEY` only on first boot. If you remove the node or let the key expire, stop the stack, delete `data/tailscale/tailscaled.state`, and start again.
+2. **Approve exit node:** In **[Machines](https://login.tailscale.com/admin/machines)**, open `...` → **Edit route settings** → check **Use as exit node**.
+3. **Route Tailnet DNS:** In **[DNS](https://login.tailscale.com/admin/dns)**, add the Tailscale IPv4 (and IPv6) of `tailscale-services` as a custom nameserver, turn **Override local DNS** **ON**, and keep **MagicDNS** **ON**.
+   > **Avoid adding a secondary public resolver (e.g. `1.1.1.1`):** OS stub resolvers race or round-robin multiple global nameservers, leaking queries past AdGuard.
+4. **Enable HTTPS certificates:** In **[DNS](https://login.tailscale.com/admin/dns)**, enable **HTTPS Certificates**. Tailscale Serve ([`config/serve.json`](config/serve.json), `AllowFunnel: false`) automatically provisions Let's Encrypt certs for your `.ts.net` domain. Verify with:
    ```bash
-   cp env.example .env
-   ```
-2. Edit `.env` and paste your key into `TS_AUTHKEY`:
-   ```env
-   TS_AUTHKEY=tskey-auth-kXXXXXX-XXXXXXXXXXXXXXXX
-   TAILSCALE_HOSTNAME=tailscale-services
-   TS_EXTRA_ARGS=--advertise-exit-node
-   RUSTDESK_RELAY_HOST=tailscale-services
-   HERMES_DASHBOARD_PASSWORD=change-me-to-a-long-random-password
-   ```
-   `HERMES_DASHBOARD_PASSWORD` is mandatory — the stack refuses to start without it.
-3. Start the containers (initialize data directories first):
-   ```bash
-   ./scripts/init-volumes.sh
-   docker compose up -d
-   ```
-4. Verify all services are running and healthy:
-   ```bash
-   docker compose ps
-   docker compose logs -f
+   docker compose exec tailscale tailscale serve status
    ```
 
 ---
 
-### Step 3: Disable Key Expiry (For 24/7 Uptime)
+## Service Setup
 
-To prevent Tailscale from disconnecting after 180 days:
-1. Go to **[Tailscale Admin → Machines](https://login.tailscale.com/admin/machines)**.
-2. Find **`tailscale-services`**.
-3. Click the three dots `...` → **Disable key expiry**.
+### AdGuard Home (`https://tailscale-services.<tailnet>.ts.net:3443`)
+- **Fresh setup:** Open `https://tailscale-services.<tailnet>.ts.net:3443` (or `http://tailscale-services:3000`) and finish the wizard. Recommended settings: Quad9/Cloudflare DoH & DoT upstreams, **Parallel requests**, **DNSSEC**, **Optimistic caching**, `20–30` rps rate limit, `7d` query log retention, and **HaGeZi Multi PRO** + **OISD Big** blocklists.
+- **Or restore the pre-configured template** ([`AdGuardHome.template.yaml`](AdGuardHome.template.yaml), defaults to `admin` / `admin`):
+  ```bash
+  docker compose stop adguardhome
+  mkdir -p data/adguard/conf
+  cp AdGuardHome.template.yaml data/adguard/conf/AdGuardHome.yaml
+  # Generate a bcrypt hash interactively and replace the default password in data/adguard/conf/AdGuardHome.yaml:
+  htpasswd -nBC 10 "" | sed 's/^://'
+  docker compose start adguardhome
+  ```
+  > Always `docker compose stop adguardhome` before editing `data/adguard/conf/AdGuardHome.yaml` so AdGuard does not overwrite your changes on exit.
 
-> **Note on `TS_AUTH_ONCE`:** the container only consumes `TS_AUTHKEY` on first boot. If you remove the node in the admin console or let the key expire, it will **not** re-register by itself — stop the stack, delete `data/tailscale/tailscaled.state`, and start it again.
-
----
-
-### Step 4: AdGuard Home Hardening
-
-1. Find the assigned Tailscale IP in **[Tailscale Machines](https://login.tailscale.com/admin/machines)**.
-2. From an **admin device**, access the AdGuard Home Web UI:
-   - The Web UI always binds to **port 3000**: `http://tailscale-services:3000` (or `http://<TAILSCALE_IP>:3000`).
-   - If you restored `AdGuardHome.template.yaml`, the admin account is empty — set a username and password immediately, anyone on the tailnet can reach that port.
-3. Complete the setup wizard (set admin username and a strong 16+ character password) if configuring without a pre-existing config.
-4. **Configure Encrypted Upstream DNS:**
-   - In AdGuard, navigate to **Settings → DNS Settings**.
-   - Under **Upstream DNS servers**, replace the defaults with encrypted resolvers:
-     ```text
-     # Quad9 (Malware blocking + DNSSEC)
-     tls://dns.quad9.net
-     https://dns.quad9.net/dns-query
-
-     # Cloudflare (Fast privacy resolver)
-     tls://1.1.1.1
-     https://cloudflare-dns.com/dns-query
-     ```
-5. **Enable DNSSEC:**
-   - Under **Settings → DNS Settings**, check **Enable DNSSEC**.
-6. **Set Rate Limiting:**
-   - Set **Rate limit** to `20` or `30` rps to mitigate client query flooding.
-7. **Performance Tuning (Sub-Millisecond DNS & Fast Browsing):**
-   - **Parallel Requests:** Under *Upstream DNS servers*, select **"Parallel requests"** (queries upstream servers concurrently, returning the fastest response).
-   - **Optimistic Caching:** Under *DNS cache configuration*, check **"Optimistic caching"** (instantly serves cached records from RAM while refreshing in the background).
-8. **Recommended Filter Lists:**
-   Go to **Filters → DNS blocklists** → **Add blocklist** → **Add a custom list**:
-   - **HaGeZi Multi PRO (Gold Standard):** `https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt`
-   - **OISD Big:** `https://big.oisd.nl`
-9. **Disk Storage & Log Retention:**
-   - Under **Settings → General Settings**, change **Query log retention** from `90 days` to **`7 days`** or **`14 days`** to keep storage lightweight.
-10. **Friendly Client Names:**
-    - Under **Settings → Client settings**, map Tailscale IPs to human names (e.g. `100.83.241.44` -> `MacBook`, `100.120.203.50` -> `iPhone`) so query logs show exact device names.
-
----
-
-### Step 5: Route Tailnet DNS to AdGuard
-
-1. Open **[Tailscale Admin → DNS](https://login.tailscale.com/admin/dns)**.
-2. Under **Nameservers**, click **Add nameserver** → **Custom**.
-3. Enter the Tailscale IPv4 (and IPv6) of your `tailscale-services` node.
-4. Toggle **Override local DNS** to **ON**.
-5. Keep **MagicDNS** **ON**.
-
-*(Optional)* You can add a secondary public DoH fallback (e.g. `1.1.1.1`) underneath AdGuard so internet stays alive if the container is restarting for updates.
-
----
-
-### Step 6: Configure RustDesk Remote Access
-
-Because RustDesk is started with key enforcement (`-k _`), get the public key generated by your server:
-
+### RustDesk
+Print the generated server public key:
 ```bash
 cat data/rustdesk/id_ed25519.pub
 ```
+In your RustDesk client (**Settings → Network → ID/Relay Server**), set:
+- **ID Server:** `tailscale-services` (or `<TAILSCALE_IP>`)
+- **Relay Server:** `<TAILSCALE_IP>:21117`
+- **Key:** contents of `data/rustdesk/id_ed25519.pub`
 
-On any RustDesk client connected to your Tailnet:
-1. Open RustDesk → Click **Settings** (3 dots next to your ID) → **Network** → **ID/Relay Server**.
-2. Set:
-   - **ID Server:** `<TAILSCALE_IP>` (or `tailscale-services`)
-   - **Relay Server:** `<TAILSCALE_IP>:21117`
-   - **Key:** Paste the public key string from `id_ed25519.pub`.
-3. Click **Apply**. The bottom status indicator will turn green (**Ready**).
+### Hermes AI Agent (`https://tailscale-services.<tailnet>.ts.net:9443`)
+Sign in with `admin` and `HERMES_DASHBOARD_PASSWORD` (also reachable via `http://tailscale-services:9119`).
 
----
-
-### Step 7: Hermes AI Agent (Zero Host Processes)
-
-**Hermes** runs as an isolated container inside the shared Tailscale network namespace:
-- **100% Containerized:** No processes, terminal sessions, or Python scripts run on the host.
-- **Auto-Started:** When you run `docker compose up -d`, everything starts together automatically.
-
-#### Web UI / Dashboard
-You can access the full Hermes Web Dashboard directly in your browser:
-- **URL:** `http://tailscale-services:9119` (or `http://<TAILSCALE_IP>:9119`)
-- **Default Username:** `admin`
-- **Password:** set `HERMES_DASHBOARD_PASSWORD` in `.env` (required — the stack refuses to start without it)
-
-Features included in the Web UI:
-- Live web chat with Hermes
-- Skills explorer & editor
-- Session history & transcript viewer
-- Platform connectors & cron jobs management
-
-#### Interactive Terminal Chat
 ```bash
-docker compose exec -it hermes hermes chat
-```
-
-> **Data directory permissions:** `./data/hermes` is `700` and owned by UID `10000` after the container's first boot (the entrypoint remaps and chowns it). Reading it from the host therefore needs `sudo`; that is intentional, it holds `.env`, `auth.json` and `state.db`.
-
-> **OpenAI-compatible API server is off by default.** To expose `/v1` on port 8642, set `API_SERVER_ENABLED=true` and a strong `API_SERVER_KEY` in `data/hermes/.env` (the server refuses to start without a key), and add the env vars to the `hermes` service.
-
-#### Switching Models
-List the models available to your configured providers, then set the default:
-```bash
-docker compose exec -it hermes hermes model
+docker compose exec -it hermes hermes setup   # Configure LLM provider keys & channels
+docker compose exec -it hermes hermes chat    # Interactive CLI chat
+docker compose exec -it hermes hermes model   # List available models
 docker compose exec -it hermes hermes config set model.default <provider>/<model>
 ```
+- `./data/hermes` is `700` owned by UID `10000` (requires `sudo` to inspect from the host).
+- The OpenAI-compatible API (`/v1` on port `8642`) is off by default; enable it by setting `API_SERVER_ENABLED=true` and a strong `API_SERVER_KEY` in `data/hermes/.env` (or under `environment:` in `docker-compose.yml`) and restarting `hermes`.
 
 ---
 
-### Step 8: Approve Exit Node in Tailscale Admin
+## Maintenance & Troubleshooting
 
-Because `TS_EXTRA_ARGS=--advertise-exit-node` is enabled by default, this node is already offering itself as an exit node. To activate it:
-
-1. In **[Tailscale Admin → Machines](https://login.tailscale.com/admin/machines)**:
-   - Click the three dots `...` next to `tailscale-services` → **Edit route settings...**
-   - Check **"Use as exit node"** and click **Save**.
-2. In your client Tailscale app (iPhone / iPad / Mac):
-   - Tap **Exit Node** → select **`tailscale-services`** whenever connecting to public Wi-Fi or traveling abroad.
-
----
-
-## Troubleshooting & Apple Device Tips
-
-### Why is an Apple Device (iPhone / iPad / Mac) not blocking ads?
-1. **iCloud Private Relay is Active:**
-   - Apple proxies Safari DNS through its own servers, bypassing Tailscale and AdGuard.
-   - Go to **Settings → [Your Name] → iCloud → Private Relay** and turn it **OFF**.
-2. **Limit IP Address Tracking on Wi-Fi:**
-   - In iOS/iPadOS: **Settings → Wi-Fi → tap `(i)` next to connected network**.
-   - Toggle **"Limit IP Address Tracking"** to **OFF**.
-3. **Tailscale "Override local DNS" is OFF:**
-   - In [Tailscale Admin → DNS](https://login.tailscale.com/admin/dns), ensure **Override local DNS** is **ON**. If OFF, devices race local Wi-Fi router DNS in parallel with AdGuard.
-4. **Mac Tailscale DNS Setting:**
-   - Click the Tailscale icon in the macOS menu bar and verify **"Use Tailscale DNS Settings"** is checked.
-
----
-
-## Maintenance & Updates
-
-### Updating Images (Manual)
-No updater container and no scheduler are installed — updates are deliberate:
+### Updating Images
+Updates are manual and must run through Compose (dependent containers bind to `tailscale`'s network namespace by container ID):
 ```bash
 docker compose pull
 docker compose up -d --remove-orphans --wait --wait-timeout 300
 ```
-Always update through Compose: every dependent service joins `tailscale`'s network namespace by container ID, so recreating `tailscale` with `docker rm`, `docker run` or Watchtower leaves the dependents on a dead namespace. `up` rebuilds `tailscale` first and re-attaches the dependents.
+- If a config edit recreates `tailscale`, verify with `docker compose ps` that dependents were also recreated.
+- Optionally run `docker image prune -f` afterwards. Images use `:latest`; pin `@sha256:...` digests if you need deterministic deploys.
+- Tail logs anytime with `docker compose logs -f [service]`.
 
-A **config** change can also recreate `tailscale` without an image change. Afterwards confirm with `docker compose ps` that the dependents were rebuilt — their healthchecks are loopback-based and keep passing even on a dead namespace.
-
-Optionally `docker image prune -f` to drop the old layers (there is no rollback afterwards).
-
-> **Version pinning:** every image is tagged `latest`, so a pull is not reproducible. If you need deterministic deploys, pin digests (`image: repo@sha256:…`) and update them deliberately.
-
-### Inspecting Logs
-```bash
-docker compose logs -f tailscale
-docker compose logs -f adguardhome
-docker compose logs -f rustdesk-hbbs
-docker compose logs -f rustdesk-hbbr
-docker compose logs -f hermes
-```
-
-### Restoring Pre-Configured Settings
-The repo includes **[`AdGuardHome.template.yaml`](AdGuardHome.template.yaml)** with all performance settings, encrypted DoH/DoT upstreams, and HaGeZi/OISD blocklists pre-configured (credentials removed).
-
-To restore it to a fresh deployment:
-```bash
-mkdir -p data/adguard/conf
-cp AdGuardHome.template.yaml data/adguard/conf/AdGuardHome.yaml
-docker compose restart adguardhome
-```
-Open `http://tailscale-services:3000` and set your admin username and password immediately.
-
-> **Existing deployment?** The template only affects a restore. To move the port on a running instance, edit `http.address` in `data/adguard/conf/AdGuardHome.yaml` to `0.0.0.0:3000` and `docker compose restart adguardhome`.
+### Apple Devices Not Blocking Ads
+1. Turn **OFF** **iCloud Private Relay** (Settings → Apple Account → iCloud).
+2. Turn **OFF** **Limit IP Address Tracking** on the active Wi-Fi network (iOS/iPadOS).
+3. Verify **Override local DNS** is **ON** in Tailscale Admin → DNS.
+4. On macOS, check **Use Tailscale DNS Settings** in the Tailscale menu bar icon.

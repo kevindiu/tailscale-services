@@ -16,10 +16,12 @@ mkdir -p "${DATA_DIR}/adguard/conf"
 mkdir -p "${DATA_DIR}/rustdesk"
 mkdir -p "${DATA_DIR}/hermes"
 
-# Set secure permissions: private to current user
-chmod 700 "${DATA_DIR}/tailscale"
-chmod 700 "${DATA_DIR}/adguard"
-chmod 700 "${DATA_DIR}/rustdesk"
-chmod 700 "${DATA_DIR}/hermes"
+# Set secure permissions: private to current user.
+# Skip directories already chowned by a container (e.g. data/hermes -> UID 10000 on Linux).
+for dir in tailscale adguard rustdesk hermes; do
+  if [ -O "${DATA_DIR}/${dir}" ]; then
+    chmod 700 "${DATA_DIR}/${dir}"
+  fi
+done
 
 echo "[✓] Directory initialization complete."

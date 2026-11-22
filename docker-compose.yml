@@ -23,19 +23,28 @@ services:
       - TS_ACCEPT_DNS=false
       # Fixed WireGuard port prevents iOS/mobile P2P connection drops across restarts
       - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0 --port=41641
+      # Declarative Tailscale Serve config for tailnet-only HTTPS (requires HTTPS enabled in Tailscale Admin -> DNS)
+      - TS_SERVE_CONFIG=/config/serve.json
       - TZ=${TZ:-Asia/Tokyo}
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv6.conf.all.forwarding=1
     volumes:
       - ./data/tailscale:/var/lib/tailscale
+      # Mount parent directory (not single file) read-only so containerboot can watch serve.json
+      - ./config:/config:ro
       - /dev/net/tun:/dev/net/tun
     # Least privilege: drop all Linux capabilities, grant only networking caps
+    # plus DAC_OVERRIDE so UID 0 can access ./data/tailscale (mode 700, owned by host user) on Linux.
+    # Note: if you add port 443 to config/serve.json later, also add NET_BIND_SERVICE here.
+    security_opt:
+      - no-new-privileges:true
     cap_drop:
       - ALL
     cap_add:
       - NET_ADMIN
       - NET_RAW
+      - DAC_OVERRIDE
     # Resource constraints to prevent DoS or memory exhaustion
     deploy:
       resources:
@@ -84,14 +93,19 @@ services:
         limits:
           memory: 512M
           pids: 256
-    # No cap_drop: AdGuard binds :53/:3000 and writes ./data/adguard (mode 700, owned
-    # by the host user). Dropping ALL capabilities would remove DAC_OVERRIDE and
-    # NET_BIND_SERVICE, so the container could neither write its volumes nor bind.
+    # Drop all capabilities (including NET_RAW inside tailscale's shared netns) and keep
+    # only NET_BIND_SERVICE (:53) and DAC_OVERRIDE (mode 700 ./data/adguard owned by host user).
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - DAC_OVERRIDE
     depends_on:
       tailscale:
         condition: service_healthy
+        restart: true
     healthcheck:
       test: ["CMD-SHELL", "nc -z -w2 127.0.0.1 53 || exit 1"]
       interval: 30s
@@ -116,6 +130,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # DAC_OVERRIDE allows UID 0 to access ./data/rustdesk (mode 700, owned by host user) on Linux
+    cap_add:
+      - DAC_OVERRIDE
     deploy:
       resources:
         limits:
@@ -124,6 +141,7 @@ services:
     depends_on:
       tailscale:
         condition: service_healthy
+        restart: true
 
   # RustDesk Relay Server
   rustdesk-hbbr:
@@ -141,6 +159,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # DAC_OVERRIDE allows UID 0 to access ./data/rustdesk (mode 700, owned by host user) on Linux
+    cap_add:
+      - DAC_OVERRIDE
     deploy:
       resources:
         limits:
@@ -149,6 +170,9 @@ services:
     depends_on:
       tailscale:
         condition: service_healthy
+        restart: true
+      rustdesk-hbbs:
+        condition: service_started
 
   # Hermes AI Agent (Autonomous Agent & Gateway)
   hermes:
@@ -166,12 +190,14 @@ services:
       - TZ=${TZ:-Asia/Tokyo}
       - HERMES_UID=10000
       - HERMES_GID=10000
-      # LLM Provider Keys (populated via .env or configured interactively via 'hermes setup')
-      - OPENAI_API_KEY=${HERMES_OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${HERMES_ANTHROPIC_API_KEY:-}
-      - OPENROUTER_API_KEY=${HERMES_OPENROUTER_API_KEY:-}
-      # Hermes Web Dashboard (Accessible over Tailscale at http://tailscale-services:9119)
-      - HERMES_DASHBOARD=${HERMES_DASHBOARD:-true}
+      # LLM Provider Keys: recommended via `docker compose exec -it hermes hermes setup`
+      # (stored in data/hermes/.env). Uncomment below only if injecting from root .env —
+      # leaving empty strings set here can shadow keys saved in data/hermes/.env.
+      # - OPENAI_API_KEY=${HERMES_OPENAI_API_KEY:?}
+      # - ANTHROPIC_API_KEY=${HERMES_ANTHROPIC_API_KEY:?}
+      # - OPENROUTER_API_KEY=${HERMES_OPENROUTER_API_KEY:?}
+      # Hermes Web Dashboard (always enabled; accessible over Tailscale at http://tailscale-services:9119)
+      - HERMES_DASHBOARD=true
       - HERMES_DASHBOARD_HOST=0.0.0.0
       - HERMES_DASHBOARD_PORT=9119
       - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${HERMES_DASHBOARD_USER:-admin}
@@ -203,3 +229,4 @@ services:
     depends_on:
       tailscale:
         condition: service_healthy
+        restart: true

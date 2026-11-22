@@ -2,8 +2,9 @@
 # Generated from working production setup with performance & security tuning.
 #
 # To restore:
-# 1. Copy this file to data/adguard/conf/AdGuardHome.yaml
-# 2. Add your admin user or run the setup wizard.
+# 1. Stop AdGuard Home first (`docker compose stop adguardhome`) so it does not overwrite the file on exit.
+# 2. Copy this file to data/adguard/conf/AdGuardHome.yaml
+# 3. Replace the default `admin` / `admin` password hash below before starting AdGuard Home.
 #
 # schema_version below was captured from a specific AdGuard Home release.
 # AdGuard migrates older schemas upward automatically, but refuses a template
@@ -24,14 +25,13 @@ http:
   address: 0.0.0.0:3000
   session_ttl: 30d
 
-# Credentials sanitized: add your user here or create one on initial setup.
-# WARNING: with `users: []` the first client on the tailnet to reach port 3000
-# can claim the admin account. Set a user immediately after restoring this file.
-# Example:
-# users:
-#   - name: admin
-#     password: <bcrypt_hash>
-users: []
+# Default credentials for restored template: admin / admin
+# WARNING: Change this password immediately! Generate a new bcrypt hash interactively with:
+#   htpasswd -nBC 10 "" | sed 's/^://'
+# Stop adguardhome before editing AdGuardHome.yaml so it does not overwrite your change on exit.
+users:
+  - name: admin
+    password: "$2y$10$fBzRaX8fNdbNshIjLxwvTu0F6JEX5um/bQg4znQBcgLZWGcINQzWy"
 auth_attempts: 5
 block_auth_min: 15
 http_proxy: ""
@@ -49,7 +49,9 @@ dns:
   ratelimit_whitelist: []
   refuse_any: true
   upstream_dns:
-    - '[/ts.net/]100.100.100.100'
+    # Optional: if non-MagicDNS clients need tailnet lookups, scope strictly to your
+    # own tailnet suffix (avoid broad [/ts.net/], which can loop on external Funnel domains):
+    # - '[/<your-tailnet>.ts.net/]100.100.100.100'
     - tls://dns.quad9.net
     - https://dns.quad9.net/dns-query
     - tls://1.1.1.1
@@ -153,10 +155,6 @@ filters:
     url: https://big.oisd.nl
     name: oisd big
     id: 1793409249
-  - enabled: true
-    url: https://raw.githubusercontent.com/jerryn70/GoodbyeAds/master/Formats/GoodbyeAds-AdBlock-Filter.txt
-    name: List 1793409250
-    id: 1793409250
   - enabled: true
     url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt
     name: HaGeZi's Multi PRO - extended protection (recommended)
