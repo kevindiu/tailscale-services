@@ -195,3 +195,132 @@ services:
       tailscale:
         condition: service_healthy
         restart: true
+
+  immich-server:
+    <<: *default-logging
+    image: ghcr.io/immich-app/immich-server:release
+    container_name: immich-server
+    restart: unless-stopped
+    stop_grace_period: 30s
+    network_mode: "service:tailscale"
+    volumes:
+      - ${IMMICH_UPLOAD_LOCATION:-./data/immich/library}:/data
+    environment:
+      - TZ=${TZ:-Asia/Tokyo}
+      - IMMICH_HOST=127.0.0.1 # Exposed via Tailscale Serve HTTPS (:2443)
+      - IMMICH_PORT=2283
+      - DB_HOSTNAME=immich-postgres
+      - DB_USERNAME=${IMMICH_DB_USER:-postgres}
+      - DB_PASSWORD=${IMMICH_DB_PASSWORD:?IMMICH_DB_PASSWORD must be set in .env}
+      - DB_DATABASE_NAME=${IMMICH_DB_NAME:-immich}
+      - REDIS_HOSTNAME=immich-redis
+      - IMMICH_MACHINE_LEARNING_URL=http://immich-machine-learning:3003
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          pids: 512
+    depends_on:
+      tailscale:
+        condition: service_healthy
+        restart: true
+      immich-postgres:
+        condition: service_healthy
+      immich-redis:
+        condition: service_healthy
+
+  # Internal backends stay on the private Compose bridge (unreachable from tailscale0)
+  immich-machine-learning:
+    <<: *default-logging
+    image: ghcr.io/immich-app/immich-machine-learning:release
+    container_name: immich-machine-learning
+    restart: unless-stopped
+    volumes:
+      - ./data/immich/model-cache:/cache
+    environment:
+      - TZ=${TZ:-Asia/Tokyo}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          pids: 512
+
+  immich-redis:
+    <<: *default-logging
+    image: docker.io/valkey/valkey:9
+    container_name: immich-redis
+    restart: unless-stopped
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    environment:
+      - TZ=${TZ:-Asia/Tokyo}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 128
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  immich-postgres:
+    <<: *default-logging
+    # Keep Postgres tag pinned to match official Immich compose (major/extension upgrades require dump/restore)
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+    container_name: immich-postgres
+    restart: unless-stopped
+    stop_grace_period: 30s
+    shm_size: 128mb
+    volumes:
+      - ./data/immich/postgres:/var/lib/postgresql/data
+    environment:
+      - TZ=${TZ:-Asia/Tokyo}
+      - POSTGRES_USER=${IMMICH_DB_USER:-postgres}
+      - POSTGRES_PASSWORD=${IMMICH_DB_PASSWORD:?IMMICH_DB_PASSWORD must be set in .env}
+      - POSTGRES_DB=${IMMICH_DB_NAME:-immich}
+      - POSTGRES_INITDB_ARGS=--data-checksums
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          pids: 256
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

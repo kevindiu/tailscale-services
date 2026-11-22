@@ -9,11 +9,12 @@ All application containers share `tailscale`'s network namespace (`network_mode:
 - **`adguardhome`**: DNS ad-blocker (`0.0.0.0:53`), loopback Web UI (`127.0.0.1:3000` → HTTPS `:3443`).
 - **`rustdesk-hbbs` / `rustdesk-hbbr`**: Private RustDesk ID & relay (`-k _`, ports `21115–21119`).
 - **`hermes`**: Containerized Hermes AI agent (`nousresearch/hermes-agent`), loopback Web UI (`127.0.0.1:9119` → HTTPS `:9443`). Opt-in `/v1` API (`:8642`) requires `API_SERVER_ENABLED=true` and `API_SERVER_KEY`.
+- **`immich-server`**: Private photo/video backup, loopback Web UI (`127.0.0.1:2283` → HTTPS `:2443`). Internal backends (`immich-postgres`, `immich-redis`, `immich-machine-learning`) run on the private Compose bridge only (unreachable from `tailscale0`).
 
 ## Security Invariants
 
 1. **No host ports:** Never add `ports:` mappings. Sole exception: `41641:41641/udp` on `tailscale` (pins WireGuard port for mobile stability).
-2. **Shared namespace:** Dependent services must keep `network_mode: "service:tailscale"` and `depends_on: tailscale: { condition: service_healthy, restart: true }`.
+2. **Shared namespace:** User-facing services must keep `network_mode: "service:tailscale"` and `depends_on: tailscale: { condition: service_healthy, restart: true }`. Internal backends (DB, cache, ML) stay on the private Compose bridge with zero host ports.
 3. **No Docker socket:** Never mount `/var/run/docker.sock` or add an updater container. Updates run manually via Compose.
 4. **No host processes:** Hermes runs strictly inside Docker; never use host scripts or `host.docker.internal`.
 5. **Tailnet-only HTTPS:** Keep `"AllowFunnel": false` for every port in `config/serve.json`. Mount `./config:/config:ro` as a directory (not a single file) so `containerboot` watches changes. If binding port `443`, add `NET_BIND_SERVICE` to `tailscale.cap_add`.
@@ -28,3 +29,4 @@ All application containers share `tailscale`'s network namespace (`network_mode:
 - **Stateful shutdowns:** Keep `stop_grace_period` on services writing DB state (Hermes uses `30s` for SQLite).
 - **Namespace re-attachment:** Dependents bind to `tailscale` by container ID. Always update through `docker compose pull && docker compose up -d --remove-orphans`, and verify dependents recreated if `tailscale` was recreated by a config change.
 - **AdGuard config edits:** Always `docker compose stop adguardhome` before editing `data/adguard/conf/AdGuardHome.yaml` (AdGuard overwrites it on exit).
+- **Concise docs & comments:** Keep docs and inline comments brief and high-signal — record only key points, invariants, and non-obvious "why"s; avoid verbose prose, obvious comments, or duplicating `README.md`.
