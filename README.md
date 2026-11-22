@@ -53,7 +53,7 @@ docker compose ps
 ## Service Setup
 
 ### AdGuard Home (`https://tailscale-services.<tailnet>.ts.net:3443`)
-- **Fresh setup:** Open `https://tailscale-services.<tailnet>.ts.net:3443` (or `http://tailscale-services:3000`) and finish the wizard. Recommended settings: Quad9/Cloudflare DoH & DoT upstreams, **Parallel requests**, **DNSSEC**, **Optimistic caching**, `20–30` rps rate limit, `7d` query log retention, and **HaGeZi Multi PRO** + **OISD Big** blocklists.
+- **Fresh setup:** Open `https://tailscale-services.<tailnet>.ts.net:3443` (or `http://tailscale-services:3000`) and finish the wizard. Recommended settings: Quad9/Cloudflare DoH & DoT upstreams with **HTTP/3 upstreams** enabled, **Parallel requests**, **DNSSEC**, **Optimistic caching** (`16 MB` cache, `300s` min TTL), `20–30` rps rate limit, `7d` query log retention, and **HaGeZi Multi PRO** + **HaGeZi TIF Mini** + **OISD Big** blocklists.
 - **Or restore the pre-configured template** ([`AdGuardHome.template.yaml`](AdGuardHome.template.yaml), defaults to `admin` / `admin`):
   ```bash
   docker compose stop adguardhome

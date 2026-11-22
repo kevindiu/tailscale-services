@@ -75,8 +75,8 @@ dns:
     - 127.0.0.0/8
     - ::1/128
   cache_enabled: true
-  cache_size: 4194304
-  cache_ttl_min: 0
+  cache_size: 16777216
+  cache_ttl_min: 300
   cache_ttl_max: 0
   cache_optimistic: true
   cache_optimistic_answer_ttl: 30s
@@ -105,7 +105,7 @@ dns:
   use_dns64: false
   dns64_prefixes: []
   serve_http3: false
-  use_http3_upstreams: false
+  use_http3_upstreams: true
   serve_plain_dns: true
   hostsfile_enabled: true
   pending_requests:
@@ -159,6 +159,10 @@ filters:
     url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt
     name: HaGeZi's Multi PRO - extended protection (recommended)
     id: 1793412260
+  - enabled: true
+    url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.mini.txt
+    name: HaGeZi's Threat Intelligence Feeds (Mini)
+    id: 1793412261
 
 whitelist_filters: []
 user_rules: []
