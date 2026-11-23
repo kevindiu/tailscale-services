@@ -6,6 +6,9 @@
     "3443": {
       "HTTPS": true
     },
+    "5443": {
+      "HTTPS": true
+    },
     "9443": {
       "HTTPS": true
     }
@@ -25,6 +28,13 @@
         }
       }
     },
+    "${TS_CERT_DOMAIN}:5443": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://127.0.0.1:9898"
+        }
+      }
+    },
     "${TS_CERT_DOMAIN}:9443": {
       "Handlers": {
         "/": {
@@ -36,6 +46,7 @@
   "AllowFunnel": {
     "${TS_CERT_DOMAIN}:2443": false,
     "${TS_CERT_DOMAIN}:3443": false,
+    "${TS_CERT_DOMAIN}:5443": false,
     "${TS_CERT_DOMAIN}:9443": false
   }
 }

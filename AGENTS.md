@@ -10,6 +10,7 @@ All application containers share `tailscale`'s network namespace (`network_mode:
 - **`rustdesk-hbbs` / `rustdesk-hbbr`**: Private RustDesk ID & relay (`-k _`, ports `21115–21119`).
 - **`hermes`**: Containerized Hermes AI agent (`nousresearch/hermes-agent`), loopback Web UI (`127.0.0.1:9119` → HTTPS `:9443`). Opt-in `/v1` API (`:8642`) requires `API_SERVER_ENABLED=true` and `API_SERVER_KEY`.
 - **`immich-server`**: Private photo/video backup, loopback Web UI (`127.0.0.1:2283` → HTTPS `:2443`). Internal backends (`immich-postgres`, `immich-redis`, `immich-machine-learning`) run on the private Compose bridge only (unreachable from `tailscale0`).
+- **`backrest`**: Encrypted Restic/rclone backup UI (`127.0.0.1:9898` → HTTPS `:5443`), mounts Immich library `:ro` at `/userdata/immich` and writable `./data/backrest/rclone` for OAuth refresh.
 
 ## Security Invariants
 

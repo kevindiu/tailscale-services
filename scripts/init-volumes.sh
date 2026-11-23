@@ -4,10 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="${ROOT_DIR}/data"
 
-mkdir -p "${DATA_DIR}"/{tailscale,adguard/work,adguard/conf,rustdesk,hermes,immich/library,immich/postgres,immich/model-cache}
+mkdir -p "${DATA_DIR}"/{tailscale,adguard/work,adguard/conf,rustdesk,hermes,immich/library,immich/postgres,immich/model-cache,backrest/data,backrest/config,backrest/cache,backrest/rclone}
 
 # Skip directories already chowned by a container (e.g. data/hermes -> UID 10000)
-for dir in tailscale adguard rustdesk hermes immich; do
+for dir in tailscale adguard rustdesk hermes immich backrest; do
   if [ -O "${DATA_DIR}/${dir}" ]; then
     chmod 700 "${DATA_DIR}/${dir}"
   fi

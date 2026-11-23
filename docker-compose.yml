@@ -324,3 +324,44 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  backrest:
+    <<: *default-logging
+    image: ghcr.io/garethgeorge/backrest:latest
+    container_name: backrest
+    restart: unless-stopped
+    stop_grace_period: 30s
+    network_mode: "service:tailscale"
+    volumes:
+      - ./data/backrest/data:/data
+      - ./data/backrest/config:/config
+      - ./data/backrest/cache:/cache
+      - ./data/backrest/rclone:/root/.config/rclone # Writable so OAuth tokens (e.g. Google Drive) refresh
+      - ${IMMICH_UPLOAD_LOCATION:-./data/immich/library}:/userdata/immich:ro
+    environment:
+      - TZ=${TZ:-Asia/Tokyo}
+      - BACKREST_PORT=127.0.0.1:9898 # Exposed via Tailscale Serve HTTPS (:5443)
+      - BACKREST_DATA=/data
+      - BACKREST_CONFIG=/config/config.json
+      - XDG_CACHE_HOME=/cache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          pids: 256
+    depends_on:
+      tailscale:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9898/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

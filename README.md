@@ -8,11 +8,12 @@ All user-facing containers share `network_mode: "service:tailscale"` with zero h
 
 | Service | Purpose | Tailnet Ports | Limits |
 | :--- | :--- | :--- | :--- |
-| **`tailscale`** | WireGuard mesh, Exit Node, HTTPS Serve | `41641/udp` *(host)*, `2443`/`3443`/`9443` (HTTPS) | 256M / 256 PIDs |
+| **`tailscale`** | WireGuard mesh, Exit Node, HTTPS Serve | `41641/udp` *(host)*, `2443`/`3443`/`5443`/`9443` (HTTPS) | 256M / 256 PIDs |
 | **`adguardhome`** | Ad-blocking DNS (DoH/DoT/H3 + DNSSEC) | `53` (DNS), `3443` (HTTPS UI) | 512M / 256 PIDs |
 | **`rustdesk-hbbs` / `hbbr`** | Private RustDesk ID & relay (`-k _`) | `21115–21119` | 256M / 256 PIDs each |
 | **`hermes`** | Containerized Hermes AI Agent + UI | `9443` (HTTPS, Basic Auth) | 2G / 1024 PIDs |
 | **`immich`** | Private photo/video backup + ML | `2443` (HTTPS UI / Mobile App) | 2G server, 4G ML, 1G DB, 256M cache |
+| **`backrest`** | Encrypted Restic/rclone cloud backup UI | `5443` (HTTPS UI) | 1G / 256 PIDs |
 
 ## Quick Start
 
@@ -63,6 +64,17 @@ docker compose exec -it hermes hermes model   # List models
 Open the URL in a browser to create your admin account, then point the Immich mobile app to `https://tailscale-services.<tailnet>.ts.net:2443`.
 - Set `IMMICH_UPLOAD_LOCATION` in `.env` to relocate photo storage (defaults to `./data/immich/library`).
 - Keep `IMMICH_DB_PASSWORD` alphanumeric-only (`A-Za-z0-9`) to avoid Postgres URL escaping issues.
+
+### Backrest Cloud Backup (`https://tailscale-services.<tailnet>.ts.net:5443`)
+Encrypted, deduplicated Restic backups with Web UI scheduling (no `rclone crypt` needed). Immich photos and daily DB dumps (`backups/`) are mounted read-only at `/userdata/immich`.
+1. **Authorize Google Drive (or any rclone remote):**
+   ```bash
+   docker compose exec -it backrest rclone config
+   ```
+   *(Name it e.g. `gdrive`; on a headless host answer `n` to auto-config and run `rclone authorize "drive"` on a machine with a browser.)*
+2. **Configure in Web UI:** Open `https://tailscale-services.<tailnet>.ts.net:5443`, create your Backrest login, then:
+   - **Add Repo:** URI `rclone:gdrive:immich-backup` + strong encryption password *(save it in a password manager!)*.
+   - **Add Plan:** Path `/userdata/immich`, exclude `/userdata/immich/thumbs` and `/userdata/immich/encoded-video`, set a daily schedule (e.g. `04:00`), and retention policy.
 
 ## Maintenance & Troubleshooting
 
