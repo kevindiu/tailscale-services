@@ -9,7 +9,7 @@ All user-facing containers share `network_mode: "service:tailscale"` with zero h
 | Service | Purpose | Tailnet Ports | Limits |
 | :--- | :--- | :--- | :--- |
 | **`tailscale`** | WireGuard mesh, Exit Node, HTTPS Serve | `41642/udp` *(host)*, `2443`/`3443`/`5443`/`9443` (HTTPS) | 512M / 256 PIDs |
-| **`adguardhome`** | Ad-blocking DNS (DoH/DoT/H3 + DNSSEC) | `53` (DNS), `3443` (HTTPS UI) | 512M / 256 PIDs |
+| **`adguardhome`** | Ad-blocking DNS (DoH/DoT/H3 + DNSSEC) | `53` (DNS), `3443` (HTTPS UI) | 1.5G / 256 PIDs |
 | **`rustdesk-hbbs` / `hbbr`** | Private RustDesk ID & relay (`-k _`) | `21115–21119` | 256M / 256 PIDs each |
 | **`hermes`** | Containerized Hermes AI Agent + UI | `9443` (HTTPS, Basic Auth) | 2G / 1024 PIDs |
 | **`immich`** | Private photo/video backup + ML | `2443` (HTTPS UI / Mobile App) | 2G server, 4G ML, 1G DB, 256M cache |
@@ -35,7 +35,7 @@ All user-facing containers share `network_mode: "service:tailscale"` with zero h
 ## Service Setup
 
 ### AdGuard Home (`https://tailscale-services.<tailnet>.ts.net:3443`)
-Restore [`AdGuardHome.template.yaml`](AdGuardHome.template.yaml) (pre-tuned with Quad9/Cloudflare DoH+DoT+H3, DNSSEC, 16 MB optimistic cache, Tailscale IPv4/IPv6 PTR, HaGeZi Multi PRO, HaGeZi TIF Mini, and OISD Big; default login `admin`/`admin`), or complete the wizard *(if using the wizard, set Admin Web Interface to `127.0.0.1` port `3000` — the default `0.0.0.0:80` breaks `:3443` and exposes plain HTTP)*:
+Restore [`AdGuardHome.template.yaml`](AdGuardHome.template.yaml) (pre-tuned with Quad9/Cloudflare DoH+DoT+H3, DNSSEC, 16 MB optimistic cache, Tailscale IPv4/IPv6 PTR, HaGeZi Multi PRO++, and HaGeZi TIF Medium; default login `admin`/`admin`), or complete the wizard *(if using the wizard, set Admin Web Interface to `127.0.0.1` port `3000` — the default `0.0.0.0:80` breaks `:3443` and exposes plain HTTP)*:
 ```bash
 docker compose stop adguardhome
 cp AdGuardHome.template.yaml data/adguard/conf/AdGuardHome.yaml

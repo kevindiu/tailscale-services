@@ -136,7 +136,7 @@ statistics:
   ignored_enabled: false
 
 filters:
-  - enabled: true
+  - enabled: false
     url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
     name: AdGuard DNS filter
     id: 1
@@ -145,17 +145,13 @@ filters:
     name: AdAway Default Blocklist
     id: 2
   - enabled: true
-    url: https://big.oisd.nl
-    name: oisd big
-    id: 1793409249
+    url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.plus.txt
+    name: HaGeZi's Multi PRO++ - maximum protection
+    id: 1793412262
   - enabled: true
-    url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt
-    name: HaGeZi's Multi PRO - extended protection (recommended)
-    id: 1793412260
-  - enabled: true
-    url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.mini.txt
-    name: HaGeZi's Threat Intelligence Feeds (Mini)
-    id: 1793412261
+    url: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.medium.txt
+    name: HaGeZi's Threat Intelligence Feeds (Medium)
+    id: 1793412263
 
 whitelist_filters: []
 user_rules: []
