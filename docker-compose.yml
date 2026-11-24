@@ -26,6 +26,10 @@ services:
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv6.conf.all.forwarding=1
+    # Decouples container bootstrap/reconnect DNS from host Tailscale DNS loops
+    dns:
+      - 9.9.9.10
+      - 1.1.1.1
     volumes:
       - ./data/tailscale:/var/lib/tailscale
       - ./config:/config:ro # Directory mount required for containerboot config watch

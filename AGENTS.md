@@ -25,7 +25,7 @@ All application containers share `tailscale`'s network namespace (`network_mode:
 ## Editing & Ops Gotchas
 
 - Keep `name: tailscale-services` at the root of `docker-compose.yml`.
-- Keep `TS_ACCEPT_DNS=false` on `tailscale` (prevents DNS loop deadlocks with AdGuard).
+- Keep `TS_ACCEPT_DNS=false` and explicit public `dns:` on `tailscale` (prevents container/host DNS loop deadlocks with AdGuard; Tailscale Admin **Use with exit node** keeps exit-node clients on AdGuard).
 - **Real healthchecks only:** Probe the actual service (`nc -z 127.0.0.1 53`, `GET /api/health`); never add catch-all fallbacks (e.g. `|| test -e /proc/net/tcp`). Do not add shell healthchecks to `rustdesk` (minimal image).
 - **Stateful shutdowns:** Keep `stop_grace_period` on services writing DB state (Hermes uses `30s` for SQLite).
 - **Namespace re-attachment:** Dependents bind to `tailscale` by container ID. Always update through `docker compose pull && docker compose up -d --remove-orphans`, and verify dependents recreated if `tailscale` was recreated by a config change.

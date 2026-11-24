@@ -28,8 +28,8 @@ All user-facing containers share `network_mode: "service:tailscale"` with zero h
 3. **Configure Tailscale Admin:**
    - **[Machines](https://login.tailscale.com/admin/machines):** Open `...` on `tailscale-services` → **Disable key expiry** and **Edit route settings** → check **Use as exit node**.
      *(With `TS_AUTH_ONCE=true`, if the node is deleted or expires, stop the stack, remove `data/tailscale/tailscaled.state`, and start again.)*
-   - **[DNS](https://login.tailscale.com/admin/dns):** Add `tailscale-services`'s Tailscale IPv4 (and IPv6) as a custom nameserver, enable **Override local DNS**, **MagicDNS**, and **HTTPS Certificates**.
-     *(Don't add a secondary public DNS like `1.1.1.1` — clients race multiple nameservers and bypass AdGuard.)*
+   - **[DNS](https://login.tailscale.com/admin/dns):** Add `tailscale-services`'s Tailscale IPv4 (and IPv6) as a custom nameserver, open `...` on it and enable **Use with exit node**, then enable **Override local DNS**, **MagicDNS**, and **HTTPS Certificates**.
+     *(Don't add a secondary public DNS like `1.1.1.1` — clients race multiple nameservers and bypass AdGuard. Enabling **Use with exit node** keeps exit-node clients on AdGuard instead of the container's bootstrap DNS.)*
    - Verify HTTPS routes: `docker compose exec tailscale tailscale serve status`
 
 ## Service Setup
