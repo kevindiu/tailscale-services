@@ -1,19 +1,19 @@
 # tailscale-services
 
-Hardened Docker Compose stack running **Tailscale**, **AdGuard Home**, **RustDesk (`hbbs` + `hbbr`)**, **Hermes AI Agent**, and **Immich** inside a private Tailscale WireGuard mesh.
+Hardened Docker Compose stack running **Tailscale**, **AdGuard Home**, **RustDesk (`hbbs` + `hbbr`)**, **Hermes AI Agent**, **Immich**, and **Backrest** inside a private Tailscale WireGuard mesh.
 
 ## Services
 
-All user-facing containers share `network_mode: "service:tailscale"` with zero host-exposed app ports (only `41641/udp` is published to pin WireGuard for mobile clients). Web UIs bind `127.0.0.1` only and are served over tailnet-only HTTPS via [`config/serve.json`](config/serve.json); Immich's DB/cache/ML stay on the private Docker bridge.
+All user-facing containers share `network_mode: "service:tailscale"` with zero host-exposed app ports (only `41642/udp` is published to pin WireGuard without colliding with a host `tailscaled` on `41641`). Web UIs bind `127.0.0.1` only and are served over tailnet-only HTTPS via [`config/serve.json`](config/serve.json); Immich's DB and authenticated Valkey run on an isolated `internal: true` bridge (`immich-internal`), and ML stays on the private Docker bridge.
 
 | Service | Purpose | Tailnet Ports | Limits |
 | :--- | :--- | :--- | :--- |
-| **`tailscale`** | WireGuard mesh, Exit Node, HTTPS Serve | `41641/udp` *(host)*, `2443`/`3443`/`5443`/`9443` (HTTPS) | 256M / 256 PIDs |
+| **`tailscale`** | WireGuard mesh, Exit Node, HTTPS Serve | `41642/udp` *(host)*, `2443`/`3443`/`5443`/`9443` (HTTPS) | 512M / 256 PIDs |
 | **`adguardhome`** | Ad-blocking DNS (DoH/DoT/H3 + DNSSEC) | `53` (DNS), `3443` (HTTPS UI) | 512M / 256 PIDs |
 | **`rustdesk-hbbs` / `hbbr`** | Private RustDesk ID & relay (`-k _`) | `21115–21119` | 256M / 256 PIDs each |
 | **`hermes`** | Containerized Hermes AI Agent + UI | `9443` (HTTPS, Basic Auth) | 2G / 1024 PIDs |
 | **`immich`** | Private photo/video backup + ML | `2443` (HTTPS UI / Mobile App) | 2G server, 4G ML, 1G DB, 256M cache |
-| **`backrest`** | Encrypted Restic/rclone cloud backup UI | `5443` (HTTPS UI) | 1G / 256 PIDs |
+| **`backrest`** | Encrypted Restic/rclone cloud backup UI | `5443` (HTTPS UI) | 2G / 256 PIDs |
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ All user-facing containers share `network_mode: "service:tailscale"` with zero h
 2. **Configure `.env` and start:**
    ```bash
    cp env.example .env && chmod 600 .env
-   # Set TS_AUTHKEY, HERMES_DASHBOARD_PASSWORD, and IMMICH_DB_PASSWORD in .env
+   # Set TS_AUTHKEY, HERMES_DASHBOARD_PASSWORD, IMMICH_DB_PASSWORD, and IMMICH_REDIS_PASSWORD in .env
    ./scripts/init-volumes.sh
    docker compose up -d
    ```
@@ -35,7 +35,7 @@ All user-facing containers share `network_mode: "service:tailscale"` with zero h
 ## Service Setup
 
 ### AdGuard Home (`https://tailscale-services.<tailnet>.ts.net:3443`)
-Complete the wizard, or restore [`AdGuardHome.template.yaml`](AdGuardHome.template.yaml) (pre-tuned with Quad9/Cloudflare DoH+DoT+H3, DNSSEC, 16 MB optimistic cache, HaGeZi Multi PRO, HaGeZi TIF Mini, and OISD Big; default login `admin`/`admin`):
+Restore [`AdGuardHome.template.yaml`](AdGuardHome.template.yaml) (pre-tuned with Quad9/Cloudflare DoH+DoT+H3, DNSSEC, 16 MB optimistic cache, Tailscale IPv4/IPv6 PTR, HaGeZi Multi PRO, HaGeZi TIF Mini, and OISD Big; default login `admin`/`admin`), or complete the wizard *(if using the wizard, set Admin Web Interface to `127.0.0.1` port `3000` — the default `0.0.0.0:80` breaks `:3443` and exposes plain HTTP)*:
 ```bash
 docker compose stop adguardhome
 cp AdGuardHome.template.yaml data/adguard/conf/AdGuardHome.yaml
@@ -58,15 +58,15 @@ docker compose exec -it hermes hermes chat    # CLI chat
 docker compose exec -it hermes hermes model   # List models
 ```
 - `./data/hermes` is `700` owned by UID `10000` (`sudo` required from host).
-- OpenAI-compatible API (`:8642`) is off by default; enable with `API_SERVER_ENABLED=true` and `API_SERVER_KEY` in `data/hermes/.env`.
+- OpenAI-compatible API (`:8642`) is off by default; enable with `API_SERVER_ENABLED=true`, `API_SERVER_HOST=127.0.0.1`, and `API_SERVER_KEY` in `data/hermes/.env`.
 
 ### Immich (`https://tailscale-services.<tailnet>.ts.net:2443`)
 Open the URL in a browser to create your admin account, then point the Immich mobile app to `https://tailscale-services.<tailnet>.ts.net:2443`.
-- Set `IMMICH_UPLOAD_LOCATION` in `.env` to relocate photo storage (defaults to `./data/immich/library`).
-- Keep `IMMICH_DB_PASSWORD` alphanumeric-only (`A-Za-z0-9`) to avoid Postgres URL escaping issues.
+- Set `IMMICH_UPLOAD_LOCATION` in `.env` to relocate photo storage (defaults to `./data/immich/library`), and `IMMICH_VERSION` to pin releases.
+- Keep `IMMICH_DB_PASSWORD` and `IMMICH_REDIS_PASSWORD` alphanumeric-only (`A-Za-z0-9`) to avoid URL/auth escaping issues.
 
 ### Backrest Cloud Backup (`https://tailscale-services.<tailnet>.ts.net:5443`)
-Encrypted, deduplicated Restic backups with Web UI scheduling (no `rclone crypt` needed). Immich photos and daily DB dumps (`backups/`) are mounted read-only at `/userdata/immich`.
+Encrypted, deduplicated Restic backups with Web UI scheduling (no `rclone crypt` needed). Immich photos + daily DB dumps (`backups/`), RustDesk keys, and AdGuard config are mounted read-only under `/userdata/{immich,rustdesk,adguard-conf}`.
 1. **Authorize Google Drive (or any rclone remote):**
    ```bash
    docker compose exec -it backrest rclone config

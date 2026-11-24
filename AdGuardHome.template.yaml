@@ -32,7 +32,7 @@ dns:
     - 0.0.0.0
   port: 53
   anonymize_client_ip: false
-  ratelimit: 20
+  ratelimit: 0 # Disabled: tailnet-only DNS; Tailscale IPv6 shares a single /48 prefix
   ratelimit_subnet_len_ipv4: 24
   ratelimit_subnet_len_ipv6: 56
   ratelimit_whitelist: []
@@ -81,9 +81,17 @@ dns:
   ipset: []
   ipset_file: ""
   bootstrap_prefer_ipv6: false
-  upstream_timeout: 10s
+  upstream_timeout: 3s
+  # Explicit list replaces AdGuard defaults — keep RFC1918 + IPv6 ULA alongside Tailscale CGNAT
   private_networks:
+    - 127.0.0.0/8
+    - ::1/128
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
     - 100.64.0.0/10
+    - fc00::/7
+    - fe80::/10
   use_private_ptr_resolvers: true
   local_ptr_upstreams:
     - 100.100.100.100 # MagicDNS PTR for 100.64.0.0/10

@@ -8,13 +8,13 @@ All application containers share `tailscale`'s network namespace (`network_mode:
 - **`tailscale`**: WireGuard mesh, MagicDNS (`tailscale-services`), exit node, and tailnet-only HTTPS proxy (`config/serve.json`).
 - **`adguardhome`**: DNS ad-blocker (`0.0.0.0:53`), loopback Web UI (`127.0.0.1:3000` → HTTPS `:3443`).
 - **`rustdesk-hbbs` / `rustdesk-hbbr`**: Private RustDesk ID & relay (`-k _`, ports `21115–21119`).
-- **`hermes`**: Containerized Hermes AI agent (`nousresearch/hermes-agent`), loopback Web UI (`127.0.0.1:9119` → HTTPS `:9443`). Opt-in `/v1` API (`:8642`) requires `API_SERVER_ENABLED=true` and `API_SERVER_KEY`.
-- **`immich-server`**: Private photo/video backup, loopback Web UI (`127.0.0.1:2283` → HTTPS `:2443`). Internal backends (`immich-postgres`, `immich-redis`, `immich-machine-learning`) run on the private Compose bridge only (unreachable from `tailscale0`).
-- **`backrest`**: Encrypted Restic/rclone backup UI (`127.0.0.1:9898` → HTTPS `:5443`), mounts Immich library `:ro` at `/userdata/immich` and writable `./data/backrest/rclone` for OAuth refresh.
+- **`hermes`**: Containerized Hermes AI agent (`nousresearch/hermes-agent`), loopback Web UI (`127.0.0.1:9119` → HTTPS `:9443`). Opt-in `/v1` API (`:8642`) requires `API_SERVER_ENABLED=true`, `API_SERVER_HOST=127.0.0.1`, and `API_SERVER_KEY`.
+- **`immich-server`**: Private photo/video backup, loopback Web UI (`127.0.0.1:2283` → HTTPS `:2443`). `immich-postgres` and password-authenticated `immich-redis` run on the isolated `immich-internal` (`internal: true`) bridge; `immich-machine-learning` stays on the default Compose bridge (unreachable from `tailscale0`).
+- **`backrest`**: Encrypted Restic/rclone backup UI (`127.0.0.1:9898` → HTTPS `:5443`), mounts `/userdata/{immich,rustdesk,adguard-conf}` `:ro` and writable `./data/backrest/rclone` for OAuth refresh.
 
 ## Security Invariants
 
-1. **No host ports:** Never add `ports:` mappings. Sole exception: `41641:41641/udp` on `tailscale` (pins WireGuard port for mobile stability).
+1. **No host ports:** Never add `ports:` mappings. Sole exception: `${TAILSCALE_UDP_PORT:-41642}:.../udp` on `tailscale` (pins WireGuard port for mobile stability without colliding with host `41641`).
 2. **Shared namespace:** User-facing services must keep `network_mode: "service:tailscale"` and `depends_on: tailscale: { condition: service_healthy, restart: true }`. Internal backends (DB, cache, ML) stay on the private Compose bridge with zero host ports.
 3. **No Docker socket:** Never mount `/var/run/docker.sock` or add an updater container. Updates run manually via Compose.
 4. **No host processes:** Hermes runs strictly inside Docker; never use host scripts or `host.docker.internal`.

@@ -10,7 +10,7 @@ x-logging: &default-logging
 services:
   tailscale:
     <<: *default-logging
-    image: tailscale/tailscale:latest
+    image: tailscale/tailscale:stable
     container_name: tailscale
     hostname: ${TAILSCALE_HOSTNAME:-tailscale-services}
     environment:
@@ -20,7 +20,7 @@ services:
       - TS_USERSPACE=false
       - TS_EXTRA_ARGS=${TS_EXTRA_ARGS:---advertise-exit-node}
       - TS_ACCEPT_DNS=false # Prevents DNS loop deadlock with AdGuard
-      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0 --port=41641
+      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0 --port=${TAILSCALE_UDP_PORT:-41642}
       - TS_SERVE_CONFIG=/config/serve.json
       - TZ=${TZ:-Asia/Tokyo}
     sysctls:
@@ -42,8 +42,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 512M
           pids: 256
+    networks:
+      - default
+      - immich-internal
     restart: unless-stopped
     # Check BackendState explicitly (`tailscale status` exits 0 even when logged out)
     healthcheck:
@@ -52,9 +55,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
-    # Only host-mapped port: pins WireGuard UDP port to prevent iOS/mobile drops
+    # Only host-mapped port: pins WireGuard UDP port (41642 avoids colliding with host tailscaled on 41641)
     ports:
-      - "41641:41641/udp"
+      - "${TAILSCALE_UDP_PORT:-41642}:${TAILSCALE_UDP_PORT:-41642}/udp"
 
   adguardhome:
     <<: *default-logging
@@ -95,6 +98,7 @@ services:
     image: rustdesk/rustdesk-server:latest
     container_name: rustdesk-hbbs
     restart: unless-stopped
+    stop_grace_period: 10s
     network_mode: "service:tailscale"
     command: hbbs -r ${RUSTDESK_RELAY_HOST:-tailscale-services}:21117 -k _
     environment:
@@ -198,7 +202,7 @@ services:
 
   immich-server:
     <<: *default-logging
-    image: ghcr.io/immich-app/immich-server:release
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
     container_name: immich-server
     restart: unless-stopped
     stop_grace_period: 30s
@@ -214,6 +218,7 @@ services:
       - DB_PASSWORD=${IMMICH_DB_PASSWORD:?IMMICH_DB_PASSWORD must be set in .env}
       - DB_DATABASE_NAME=${IMMICH_DB_NAME:-immich}
       - REDIS_HOSTNAME=immich-redis
+      - REDIS_PASSWORD=${IMMICH_REDIS_PASSWORD:?IMMICH_REDIS_PASSWORD must be set in .env}
       - IMMICH_MACHINE_LEARNING_URL=http://immich-machine-learning:3003
     security_opt:
       - no-new-privileges:true
@@ -226,6 +231,7 @@ services:
         limits:
           memory: 2G
           pids: 512
+    # Uses built-in immich-healthcheck from upstream image
     depends_on:
       tailscale:
         condition: service_healthy
@@ -235,10 +241,10 @@ services:
       immich-redis:
         condition: service_healthy
 
-  # Internal backends stay on the private Compose bridge (unreachable from tailscale0)
+  # Stays on default bridge (needs outbound access on first run to fetch models); uses built-in immich-healthcheck
   immich-machine-learning:
     <<: *default-logging
-    image: ghcr.io/immich-app/immich-machine-learning:release
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-release}
     container_name: immich-machine-learning
     restart: unless-stopped
     volumes:
@@ -257,14 +263,25 @@ services:
           memory: 4G
           pids: 512
 
+  # Isolated on no-egress immich-internal bridge (unreachable from tailscale0 and internet)
   immich-redis:
     <<: *default-logging
     image: docker.io/valkey/valkey:9
     container_name: immich-redis
     restart: unless-stopped
-    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    networks:
+      - immich-internal
+    command:
+      - valkey-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --requirepass
+      - ${IMMICH_REDIS_PASSWORD:?IMMICH_REDIS_PASSWORD must be set in .env}
     environment:
       - TZ=${TZ:-Asia/Tokyo}
+      - VALKEYCLI_AUTH=${IMMICH_REDIS_PASSWORD:?IMMICH_REDIS_PASSWORD must be set in .env}
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -294,6 +311,8 @@ services:
     container_name: immich-postgres
     restart: unless-stopped
     stop_grace_period: 30s
+    networks:
+      - immich-internal
     shm_size: 128mb
     volumes:
       - ./data/immich/postgres:/var/lib/postgresql/data
@@ -338,6 +357,8 @@ services:
       - ./data/backrest/cache:/cache
       - ./data/backrest/rclone:/root/.config/rclone # Writable so OAuth tokens (e.g. Google Drive) refresh
       - ${IMMICH_UPLOAD_LOCATION:-./data/immich/library}:/userdata/immich:ro
+      - ./data/rustdesk:/userdata/rustdesk:ro
+      - ./data/adguard/conf:/userdata/adguard-conf:ro
     environment:
       - TZ=${TZ:-Asia/Tokyo}
       - BACKREST_PORT=127.0.0.1:9898 # Exposed via Tailscale Serve HTTPS (:5443)
@@ -353,7 +374,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
           pids: 256
     depends_on:
       tailscale:
@@ -365,3 +386,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+networks:
+  immich-internal:
+    internal: true
