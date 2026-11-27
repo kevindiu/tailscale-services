@@ -1,6 +1,6 @@
 # tailscale-services
 
-Hardened Docker Compose stack running **Tailscale**, **AdGuard Home**, **RustDesk (`hbbs` + `hbbr`)**, **Hermes AI Agent**, **Immich**, and **Backrest** inside a private Tailscale WireGuard mesh.
+Hardened Docker Compose stack running **Tailscale**, **AdGuard Home**, **RustDesk (`hbbs` + `hbbr`)**, **Hermes AI Agent**, **Immich**, and **Rclone Manager** inside a private Tailscale WireGuard mesh.
 
 ## Services
 
@@ -13,7 +13,7 @@ All user-facing containers share `network_mode: "service:tailscale"` with zero h
 | **`rustdesk-hbbs` / `hbbr`** | Private RustDesk ID & relay (`-k _`) | `21115–21119` | 256M / 256 PIDs each |
 | **`hermes`** | Containerized Hermes AI Agent + UI | `9443` (HTTPS, Basic Auth) | 2G / 1024 PIDs |
 | **`immich`** | Private photo/video backup + ML | `2443` (HTTPS UI / Mobile App) | 2G server, 4G ML, 1G DB, 256M cache |
-| **`backrest`** | Encrypted Restic/rclone cloud backup UI | `5443` (HTTPS UI) | 2G / 256 PIDs |
+| **`rclone-manager`** | Cloud backup, versioning & file browser | `5443` (HTTPS UI, Login) | 1G / 256 PIDs |
 
 ## Quick Start
 
@@ -65,16 +65,10 @@ Open the URL in a browser to create your admin account, then point the Immich mo
 - Set `IMMICH_UPLOAD_LOCATION` in `.env` to relocate photo storage (defaults to `./data/immich/library`), and `IMMICH_VERSION` to pin releases.
 - Keep `IMMICH_DB_PASSWORD` and `IMMICH_REDIS_PASSWORD` alphanumeric-only (`A-Za-z0-9`) to avoid URL/auth escaping issues.
 
-### Backrest Cloud Backup (`https://tailscale-services.<tailnet>.ts.net:5443`)
-Encrypted, deduplicated Restic backups with Web UI scheduling (no `rclone crypt` needed). Immich photos + daily DB dumps (`backups/`), RustDesk keys, and AdGuard config are mounted read-only under `/userdata/{immich,rustdesk,adguard-conf}`.
-1. **Authorize Google Drive (or any rclone remote):**
-   ```bash
-   docker compose exec -it backrest rclone config
-   ```
-   *(Name it e.g. `gdrive`; on a headless host answer `n` to auto-config and run `rclone authorize "drive"` on a machine with a browser.)*
-2. **Configure in Web UI:** Open `https://tailscale-services.<tailnet>.ts.net:5443`, create your Backrest login, then:
-   - **Add Repo:** URI `rclone:gdrive:immich-backup` + strong encryption password *(save it in a password manager!)*.
-   - **Add Plan:** Path `/userdata/immich`, exclude `/userdata/immich/thumbs` and `/userdata/immich/encoded-video`, set a daily schedule (e.g. `04:00`), and retention policy.
+### Rclone Manager (`https://tailscale-services.<tailnet>.ts.net:5443`)
+Open the URL in a browser to create your admin account on first visit (or pre-seed via `RCLONE_MANAGER_ADMIN_USER` / `RCLONE_MANAGER_ADMIN_PASSWORD` in `.env`, min 8 chars).
+- Immich library (`${IMMICH_UPLOAD_LOCATION}`) is mounted read-only at `/source/immich`; restored files can target `/restore` (`./data/rclone-manager/restore`).
+- Configure remotes (Google Drive, Crypt, S3, etc.) and scheduled incremental `--backup-dir` jobs directly in the Web UI.
 
 ## Maintenance & Troubleshooting
 

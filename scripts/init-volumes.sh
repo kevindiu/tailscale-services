@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="${ROOT_DIR}/data"
 
-mkdir -p "${DATA_DIR}"/{tailscale,adguard/work,adguard/conf,rustdesk,hermes,immich/library,immich/postgres,immich/model-cache,backrest/data,backrest/config,backrest/cache,backrest/rclone}
+mkdir -p "${DATA_DIR}"/{tailscale,adguard/work,adguard/conf,rustdesk,hermes,immich/library,immich/postgres,immich/model-cache,rclone-manager/restore}
 
 # Also create custom IMMICH_UPLOAD_LOCATION if configured in .env
 if [ -f "${ROOT_DIR}/.env" ]; then
@@ -25,7 +25,7 @@ fi
 
 # Skip directories already chowned by a non-root container (e.g. data/hermes -> UID 10000),
 # and warn if root-owned directories (e.g. created by Docker) remain world-readable.
-for dir in tailscale adguard rustdesk hermes immich backrest; do
+for dir in tailscale adguard rustdesk hermes immich rclone-manager; do
   target="${DATA_DIR}/${dir}"
   if [ -O "${target}" ]; then
     chmod 700 "${target}"

@@ -10,7 +10,7 @@ All application containers share `tailscale`'s network namespace (`network_mode:
 - **`rustdesk-hbbs` / `rustdesk-hbbr`**: Private RustDesk ID & relay (`-k _`, ports `21115–21119`).
 - **`hermes`**: Containerized Hermes AI agent (`nousresearch/hermes-agent`), loopback Web UI (`127.0.0.1:9119` → HTTPS `:9443`). Opt-in `/v1` API (`:8642`) requires `API_SERVER_ENABLED=true`, `API_SERVER_HOST=127.0.0.1`, and `API_SERVER_KEY`.
 - **`immich-server`**: Private photo/video backup, loopback Web UI (`127.0.0.1:2283` → HTTPS `:2443`). `immich-postgres` and password-authenticated `immich-redis` run on the isolated `immich-internal` (`internal: true`) bridge; `immich-machine-learning` stays on the default Compose bridge (unreachable from `tailscale0`).
-- **`backrest`**: Encrypted Restic/rclone backup UI (`127.0.0.1:9898` → HTTPS `:5443`), mounts `/userdata/{immich,rustdesk,adguard-conf}` `:ro` and writable `./data/backrest/rclone` for OAuth refresh.
+- **`rclone-manager`**: Cloud backup & encrypted file browser (`ghcr.io/kevindiu/rclone-manager`), loopback Web UI (`127.0.0.1:8085` → HTTPS `:5443`), non-root `UID 1000`, mounts `${IMMICH_UPLOAD_LOCATION}` read-only at `/source/immich` and `./data/rclone-manager/restore` at `/restore`. Uses SQLite `DELETE` journal mode for OrbStack `virtiofs` safety.
 
 ## Security Invariants
 

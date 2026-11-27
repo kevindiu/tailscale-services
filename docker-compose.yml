@@ -348,48 +348,41 @@ services:
       retries: 5
       start_period: 20s
 
-  backrest:
+  rclone-manager:
     <<: *default-logging
-    image: ghcr.io/garethgeorge/backrest:latest
-    container_name: backrest
+    image: ghcr.io/kevindiu/rclone-manager:${RCLONE_MANAGER_VERSION:-latest}
+    container_name: rclone-manager
     restart: unless-stopped
-    stop_grace_period: 30s
+    stop_grace_period: 30s # Clean SQLite & rclone SIGINT shutdown
     network_mode: "service:tailscale"
     volumes:
-      - ./data/backrest/data:/data
-      - ./data/backrest/config:/config
-      - ./data/backrest/cache:/cache
-      - ./data/backrest/rclone:/root/.config/rclone # Writable so OAuth tokens (e.g. Google Drive) refresh
-      - ${IMMICH_UPLOAD_LOCATION:-./data/immich/library}:/userdata/immich:ro
-      - ./data/rustdesk:/userdata/rustdesk:ro
-      - ./data/adguard/conf:/userdata/adguard-conf:ro
+      - ./data/rclone-manager:/config
+      - ./data/rclone-manager/restore:/restore
+      - ${IMMICH_UPLOAD_LOCATION:-./data/immich/library}:/source/immich:ro
     environment:
       - TZ=${TZ:-Asia/Tokyo}
-      - BACKREST_PORT=127.0.0.1:9898 # Exposed via Tailscale Serve HTTPS (:5443)
-      - BACKREST_DATA=/data
-      - BACKREST_CONFIG=/config/config.json
-      - XDG_CACHE_HOME=/cache
+      - RCLONE_MANAGER_HOST=127.0.0.1 # Exposed via Tailscale Serve HTTPS (:5443)
+      - PORT=8085
+      - RCLONE_MANAGER_DATA_DIR=/config
+      # DELETE journal mode avoids SQLite WAL -shm corruption across OrbStack virtiofs bind mounts
+      - RCLONE_MANAGER_DB_PATH=/config/rclone-manager.db?_pragma=journal_mode(DELETE)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)
+      # Optional: seed initial admin account (min 8-char password); leave unset to configure via Web UI on first visit
+      - RCLONE_MANAGER_ADMIN_USER=${RCLONE_MANAGER_ADMIN_USER:-}
+      - RCLONE_MANAGER_ADMIN_PASSWORD=${RCLONE_MANAGER_ADMIN_PASSWORD:-}
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    cap_add:
-      - DAC_OVERRIDE
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 1G
           pids: 256
+    # Uses built-in /api/health healthcheck from upstream image
     depends_on:
       tailscale:
         condition: service_healthy
         restart: true
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9898/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
 
 networks:
   immich-internal:

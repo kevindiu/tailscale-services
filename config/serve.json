@@ -31,7 +31,7 @@
     "${TS_CERT_DOMAIN}:5443": {
       "Handlers": {
         "/": {
-          "Proxy": "http://127.0.0.1:9898"
+          "Proxy": "http://127.0.0.1:8085"
         }
       }
     },
